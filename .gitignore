@@ -1,0 +1,34 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Local databases, indexes, and uploaded source documents
+*.db
+*.db-shm
+*.db-wal
+vector_db/
+documents/
+
+# Local model weights and editor/OS files
+models/
+.DS_Store
+.idea/
+.vscode/
+
+# Local agent/workbench metadata and extracted source data
+.agents/
+.codewhale/
+CLAUDE.md
+scifinder_extracted.json

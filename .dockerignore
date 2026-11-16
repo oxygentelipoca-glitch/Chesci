@@ -1,0 +1,9 @@
+.git
+.venv
+.DS_Store
+.env
+database.db
+vector_db
+documents
+frontend/node_modules
+frontend/dist
