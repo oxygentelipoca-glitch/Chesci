@@ -9,13 +9,13 @@
 
 from __future__ import annotations
 
-import re
 from typing import Optional
 
 from sqlmodel import Session, select
 
 from app.chemistry.models import Reaction, ReactionCondition
 from app.database import chemistry_engine
+from app.chemistry.constraints import peak_temperature, yield_range
 
 # ---------------------------------------------------------------------------
 # 危险试剂关键词
@@ -43,16 +43,8 @@ def _parse_yield(yield_str: Optional[str]) -> float:
     - "71-94%" → 82.5（取平均值）
     - None → 50.0（中性）
     """
-    if not yield_str:
-        return 50.0
-    # 提取所有数字
-    nums = re.findall(r"(\d+\.?\d*)", yield_str)
-    if not nums:
-        return 50.0
-    values = [float(n) for n in nums if 0 < float(n) <= 100]
-    if not values:
-        return 50.0
-    return sum(values) / len(values)
+    bounds = yield_range(yield_str)
+    return sum(bounds) / 2 if bounds else 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -75,95 +67,25 @@ def _score_temperature(temperature: Optional[str]) -> float:
 
     t = temperature.lower().strip()
 
-    if any(kw in t for kw in ["rt", "室温", "常温", "room temp", "ambient"]):
+    if t in {"rt", "r.t.", "室温", "常温", "room temperature", "ambient"}:
         return 100.0
     if any(kw in t for kw in ["reflux", "回流"]):
         return 60.0
-    if any(kw in t for kw in ["ice", "冰", "0°c", "0 ℃", "cold", "低温", "冷冻"]):
-        return 70.0  # 低温可控但需要特殊设备
-
-    # 提取温度数值
-    nums = re.findall(r"(\d+\.?\d*)", t)
-    values = [float(n) for n in nums if float(n) < 1000]
-    if values:
-        avg_temp = sum(values) / len(values)
-        if avg_temp <= 50:
-            return 90.0
-        if avg_temp <= 100:
+    if any(kw in t for kw in ["ice", "冰", "cold", "低温", "冷冻"]):
+        return 70.0
+    peak = peak_temperature(t)
+    if peak is not None:
+        if peak <= 0:
             return 70.0
-        if avg_temp <= 150:
+        if peak <= 50:
+            return 90.0
+        if peak <= 100:
+            return 70.0
+        if peak <= 150:
             return 50.0
         return 30.0
 
     return 70.0
-
-
-def extract_temperature_celsius(temperature: Optional[str]) -> Optional[float]:
-    """从温度文本提取摄氏温度数值（用于筛选比较）。
-
-    - "85 °C" → 85.0
-    - "85 °C → rt" → 85.0（取最高值，最严格条件）
-    - "rt" / "室温" → 25.0
-    - "reflux" / 无法解析 → None（无法量化）
-    """
-    if not temperature:
-        return None
-    t = temperature.lower().strip()
-    nums = [float(n) for n in re.findall(r"(\d+\.?\d*)", t) if float(n) < 1000]
-    if nums:
-        return max(nums)
-    if any(kw in t for kw in ["rt", "室温", "常温", "room temp", "ambient"]):
-        return 25.0
-    return None
-
-
-# 后处理操作关键词（other 字段描述）
-_WORKUP_KEYWORDS = [
-    "neutralized", "acidified", "cooled", "washed", "filtered",
-    "extracted", "dried", "quenched", "recrystallized", "crystallized",
-    "concentrated", "evaporated", "purified", "distilled",
-]
-
-
-def has_workup(other_text: Optional[str]) -> bool:
-    """判断条件描述（other 字段）是否包含后处理操作。
-
-    - "neutralized, cooled" → True
-    - "pH 3" → True（pH 调整属于后处理）
-    - "heated" → False（加热属于反应条件，不算后处理）
-    """
-    if not other_text:
-        return False
-    t = other_text.lower()
-    if re.search(r"\bph\b", t):
-        return True
-    return any(kw in t for kw in _WORKUP_KEYWORDS)
-
-
-def extract_time_hours(time_text: Optional[str]) -> Optional[float]:
-    """从时间文本提取小时数（多段取最大值）。
-
-    - "2 h" → 2.0
-    - "15 min" → 0.25
-    - "8 h; 2 h" → 8.0（取最长）
-    - "3 - 4 h" → 4.0
-    - 无法解析 → None
-    """
-    if not time_text:
-        return None
-    t = time_text.lower().strip()
-    values: list[float] = []
-    pattern = re.compile(r"(\d+\.?\d*)\s*(h|hr|hrs|hour|hours|min|minute|minutes|d|day|days)")
-    for m in pattern.finditer(t):
-        val = float(m.group(1))
-        unit = m.group(2)
-        if unit.startswith("h"):
-            values.append(val)
-        elif unit.startswith("m"):
-            values.append(val / 60.0)
-        elif unit.startswith("d"):
-            values.append(val * 24.0)
-    return max(values) if values else None
 
 
 # ---------------------------------------------------------------------------
@@ -226,17 +148,28 @@ def score_reaction(reaction_id: int) -> dict:
         safety_score = _score_safety(all_reagents)
 
         # 加权总分
-        total = (
-            yield_val * 0.35 +
-            step_score * 0.15 +
-            temp_score * 0.20 +
-            safety_score * 0.30
-        )
+        dimensions = [
+            ("收率", 35, yield_val,
+             f"记录 {reaction.yield_}；范围取中点" if yield_range(reaction.yield_) else "无可解析收率，暂按 50 分"),
+            ("步骤", 15, step_score,
+             f"{steps} 步；每多一步扣 15 分" if reaction.steps else "步骤未记录，暂按一步计 100 分"),
+            ("温度", 20, temp_score,
+             "各条件取最低分。数值温度 ≤0 / ≤50 / ≤100 / ≤150 / >150 °C 依次计 70 / 90 / 70 / 50 / 30 分；室温 100，回流 60，低温描述、缺失或未识别 70。记录：" +
+             ("；".join(c.temperature or "未记录" for c in conditions) or "未记录")),
+            ("试剂风险", 30, safety_score,
+             "仅筛查试剂、催化剂和溶剂关键词，每次命中扣 20 分；" +
+             ("命中：" + "、".join(k for k in HAZARDOUS_REAGENTS if k in all_reagents.lower())
+              if safety_score < 80 else ("未命中，按基准 80 分" if all_reagents.strip() else "无试剂记录，按基准 80 分"))),
+        ]
+        total = sum(weight * value / 100 for _, weight, value, _ in dimensions)
+
 
     return {
         "reaction_id": reaction_id,
         "cas_registry_id": reaction.cas_registry_id,
         "yield_raw": reaction.yield_,
+        "dimensions": [{"label": label, "weight": weight, "score": round(value, 1), "basis": basis}
+                       for label, weight, value, basis in dimensions],
         "yield_score": round(yield_val, 1),
         "step_score": round(step_score, 1),
         "temp_score": round(temp_score, 1),

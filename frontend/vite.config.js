@@ -1,24 +1,26 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
+const backend = process.env.CHEMFINDER_BACKEND_URL || 'http://127.0.0.1:8000'
+
 export default defineConfig({
   plugins: [vue()],
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:8002',
+        target: backend,
         changeOrigin: true,
       },
       '/auth': {
-        target: 'http://localhost:8002',
+        target: backend,
         changeOrigin: true,
       },
       '/files': {
-        target: 'http://localhost:8002',
+        target: backend,
         changeOrigin: true,
       },
       '/upload': {
-        target: 'http://localhost:8002',
+        target: backend,
         changeOrigin: true,
       },
     },

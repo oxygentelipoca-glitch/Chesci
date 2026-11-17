@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 
-import chromadb
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
@@ -9,7 +8,6 @@ from app.core.auth import get_current_user, resolve_current_user_id
 from app.core.response import api_success
 from app.database import engine
 from app.models import File
-from utils.vector_store import sync_system_documents
 
 
 
@@ -21,22 +19,6 @@ router = APIRouter(
 
 )
 
-
-
-# Chroma客户端
-
-chroma_client = chromadb.PersistentClient(
-
-    path="vector_db"
-
-)
-
-
-collection = chroma_client.get_collection(
-
-    "knowledge"
-
-)
 
 
 def _system_documents(folder_path: str = "documents"):
@@ -71,7 +53,8 @@ def get_index_status(current_user: dict = Depends(get_current_user)):
     with Session(engine) as session:
         resolve_current_user_id(current_user, session)
 
-    indexed = collection.get(include=["metadatas"])
+    from utils.rag_resources import get_collection
+    indexed = get_collection().get(include=["metadatas"])
     metadatas = indexed.get("metadatas") or []
     system_names = {item["filename"] for item in _system_documents()}
     indexed_system_names = {
@@ -98,6 +81,7 @@ def reindex_system_documents(current_user: dict = Depends(get_current_user)):
     with Session(engine) as session:
         resolve_current_user_id(current_user, session)
 
+    from utils.vector_store import sync_system_documents
     chunk_count = sync_system_documents()
     from app.services.rag_service import rebuild_bm25
     rebuild_bm25()
@@ -193,7 +177,8 @@ def delete_file(
         try:
 
 
-            collection.delete(
+            from utils.rag_resources import get_collection
+            get_collection().delete(
                 where={
                     "stored_filename":
                     stored_filename,

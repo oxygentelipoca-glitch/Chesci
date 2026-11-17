@@ -137,7 +137,7 @@ def sync_to_neo4j() -> dict:
                     """
                     MERGE (r:Reaction {id: $id})
                     SET r.cas_registry_id = $cas,
-                        r.yield = $yield,
+                        r.`yield` = $yield_value,
                         r.reactants_text = $reactants,
                         r.products_text = $products
                     """,

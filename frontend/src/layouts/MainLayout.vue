@@ -1,109 +1,44 @@
 <script setup>
-import { ref } from 'vue'
-import { useRouter, useRoute } from 'vue-router'
+import { useRouter } from 'vue-router'
 import { getStoredUser, logout } from '../api/auth.js'
 
 const router = useRouter()
-const route = useRoute()
-
+const username = getStoredUser()?.username || '游客'
 const navItems = [
-  { path: '/', label: '首页', icon: '📊' },
-  { path: '/route-planning', label: '路线规划', icon: '🧬' },
-  { path: '/knowledge-graph', label: '知识图谱', icon: '🔗' },
-  { path: '/literature', label: '文献检索', icon: '📚' },
-  { path: '/experiment', label: '实验助手', icon: '⚗️' },
+  ['/', '工作台'], ['/route-planning', '路线规划'], ['/knowledge-graph', '知识图谱'],
+  ['/literature', '文献检索'], ['/experiment', '实验助手'],
 ]
-
-const username = ref(getStoredUser()?.username || '游客')
-
-function isActive(path) { return route.path === path }
-function navigate(path) { router.push(path) }
-
 function handleLogout() {
   logout()
   router.push('/login')
 }
 </script>
-
 <template>
   <div class="app-shell">
-    <!-- 顶栏 -->
-    <header class="topbar">
-      <div class="tb-brand">
-        <span class="tb-logo">⬡</span>
-        <span class="tb-name">ChemGraph AI</span>
-        <span class="tb-sub">智能化学研发平台</span>
-      </div>
-      <div class="tb-right">
-        <span class="tb-user">👤 {{ username }}</span>
-        <button class="tb-logout" @click="handleLogout">退出</button>
+    <header class="shell-bar">
+      <div class="shell-inner">
+        <RouterLink class="brand" to="/" aria-label="ChemFinder 首页"><img src="/favicon.svg" alt="" />ChemFinder</RouterLink>
+        <nav aria-label="研究工作区"><RouterLink v-for="[path, label] in navItems" :key="path" :to="path">{{ label }}</RouterLink></nav>
+        <div class="account"><span>{{ username }}</span><button @click="handleLogout">退出</button></div>
       </div>
     </header>
-
-    <div class="app-body">
-      <!-- 侧栏 -->
-      <nav class="sidebar">
-        <div
-          v-for="item in navItems" :key="item.path"
-          class="nav-item" :class="{ active: isActive(item.path) }"
-          @click="navigate(item.path)"
-        >
-          <span class="nav-icon">{{ item.icon }}</span>
-          <span class="nav-label">{{ item.label }}</span>
-        </div>
-      </nav>
-
-      <!-- 工作区 -->
-      <main class="workspace">
-        <slot />
-      </main>
-    </div>
+    <main class="workspace"><slot /></main>
   </div>
 </template>
-
 <style scoped>
-.app-shell { height: 100vh; display: flex; flex-direction: column; }
-
-/* 顶栏 */
-.topbar {
-  height: 44px; display: flex; align-items: center; justify-content: space-between;
-  padding: 0 20px; background: var(--primary); color: #fff; flex-shrink: 0;
-  user-select: none;
+.shell-bar { background:white; border-bottom:1px solid var(--border) }
+.shell-inner,.workspace { width:min(1200px,92%); margin:auto }
+.shell-inner { display:flex; align-items:center; gap:clamp(20px,4vw,68px); min-height:70px }
+nav { display:flex; gap:clamp(14px,2vw,32px); align-self:stretch }
+nav a { display:grid; align-items:center; color:var(--text-light); font-weight:600; padding:0 2px; border-bottom:3px solid transparent; border-top:3px solid transparent }
+nav a.router-link-exact-active { color:var(--primary); border-bottom-color:var(--primary) }
+.account { margin-left:auto; display:flex; align-items:center; gap:12px; min-width:0; color:var(--text-light) }
+.account span { max-width:12ch; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+.account button { cursor:pointer; border:1px solid var(--border); border-radius:6px; padding:4px 10px; background:white; color:var(--text) }
+.workspace { padding:clamp(20px,3.5vw,48px) 0 60px; }
+@media(max-width:800px){
+  .shell-inner { flex-wrap:wrap; gap:0; padding-top:12px }
+  nav { order:3; width:100%; justify-content:space-between; gap:6px; padding-top:6px }
+  nav a { min-height:43px; font-size:13px }
 }
-.tb-brand { display: flex; align-items: center; gap: 8px; }
-.tb-logo { font-size: 20px; }
-.tb-name { font-weight: 700; font-size: 15px; letter-spacing: 0.5px; }
-.tb-sub { font-size: 11px; opacity: 0.7; margin-left: 4px; }
-.tb-right { display: flex; align-items: center; gap: 16px; font-size: 13px; opacity: 0.85; }
-.tb-logout {
-  background: rgba(255, 255, 255, 0.15);
-  color: #fff;
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  border-radius: 6px;
-  padding: 4px 12px;
-  font-size: 12px;
-  cursor: pointer;
-  transition: background 0.12s;
-}
-.tb-logout:hover { background: rgba(255, 255, 255, 0.3); }
-
-/* 主体 */
-.app-body { display: flex; flex: 1; overflow: hidden; }
-
-/* 侧栏 */
-.sidebar {
-  width: 180px; flex-shrink: 0; background: #FFF; border-right: 1px solid var(--border);
-  padding: 12px 8px; display: flex; flex-direction: column; gap: 2px;
-}
-.nav-item {
-  display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-  border-radius: var(--radius); cursor: pointer; font-size: 13px; color: var(--text);
-  transition: all 0.12s; user-select: none;
-}
-.nav-item:hover { background: var(--primary-pale); }
-.nav-item.active { background: var(--primary-pale); color: var(--primary); font-weight: 600; }
-.nav-icon { font-size: 16px; width: 22px; text-align: center; }
-
-/* 工作区 */
-.workspace { flex: 1; overflow: auto; padding: 24px; background: var(--bg); }
 </style>

@@ -1,4 +1,4 @@
-"""化学领域 ORM 模型 — 基于 reactions.db 的外部提取数据库。
+"""化学领域 ORM 模型 — reactions.db 中的合成反应数据。
 
     reactions.db 由 SciFinder PDF 提取程序生成，包含5个核心表：
     - schemes：合成方案（Scheme），是反应的逻辑分组
@@ -7,7 +7,7 @@
     - literature：文献引用（标题、作者、期刊、年份等）
     - extraction_log：提取批次日志（LLM 调用记录）
 
-    这些表由外部程序维护，本模块仅进行只读映射和查询。
+    支持 SciFinder PDF 提取结果经人工校对后写入，并由本模块查询。
 """
 
 from __future__ import annotations

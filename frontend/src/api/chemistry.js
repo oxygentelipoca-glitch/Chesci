@@ -87,6 +87,26 @@ export async function getReactionLiterature(id) {
   return res.data.data
 }
 
+/** Extract a SciFinder PDF into editable preview data. */
+export async function previewSciFinderImport(file, maxSchemes = 5, documentType = "scifinder") {
+  const form = new FormData()
+  form.append("file", file)
+  form.append("document_type", documentType)
+  form.append("max_schemes", String(maxSchemes))
+  const res = await axios.post(`${API_BASE}/api/chemistry/import/scifinder/preview`, form, {
+    headers: authHeaders(),
+  })
+  return res.data.data
+}
+
+/** Import the reviewed and corrected SciFinder preview into reactions.db. */
+export async function confirmSciFinderImport(payload) {
+  const res = await axios.post(`${API_BASE}/api/chemistry/import/scifinder/confirm`, payload, {
+    headers: authHeaders(),
+  })
+  return res.data.data
+}
+
 // ─── Knowledge Graph ────────────────────────────────────────────────────────
 
 /**

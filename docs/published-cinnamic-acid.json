@@ -1,0 +1,18 @@
+{
+  "schemes": [{"scheme_number": 3, "page_start": 2, "page_end": 3, "description": "Rudyanto 与 Hartanti，化合物 1"}],
+  "reactions": [{
+    "scheme_number": 3,
+    "page": 2,
+    "reactants": "苯甲醛、丙二酸",
+    "products": "肉桂酸",
+    "yield": "85.3 ± 2.9%",
+    "conditions": {"temperature": "回流", "time": "5 h", "solvents": "吡啶", "reagents": "哌啶"},
+    "title": "Synthesis of Some Cinnamic Acid Derivatives: Effect of Groups Attached on Aromatic Ring to the Reactivity of Benzaldehyde",
+    "authors": "Marcellino Rudyanto, Lanny Hartanti",
+    "source": "Indonesian Journal of Chemistry (2008), 8(2), 226–230. DOI 10.22146/ijc.21626",
+    "source_refs": [
+      {"label": "实验条件 · 期刊第 227 页 Prosedur", "url": "https://journal.ugm.ac.id/ijc/article/download/21626/14331#page=2"},
+      {"label": "收率 · 期刊第 228 页表 1，化合物 1", "url": "https://journal.ugm.ac.id/ijc/article/download/21626/14331#page=3"}
+    ]
+  }]
+}

@@ -7,7 +7,6 @@ from app.core.auth import get_current_user, resolve_current_user_id
 from app.core.response import api_error, api_success
 from app.database import engine
 from app.models import File as FileModel
-from utils.vector_store import add_file_to_store
 
 router = APIRouter(prefix="/upload", tags=["Upload"])
 
@@ -45,6 +44,7 @@ async def upload_file(
 
     # ---- Incremental vector indexing (was full rebuild) ------------------
     try:
+        from utils.vector_store import add_file_to_store
         chunk_count = add_file_to_store(filepath, file.filename, user_id)
         # Refresh BM25 index so new chunks are searchable
         from app.services.rag_service import rebuild_bm25

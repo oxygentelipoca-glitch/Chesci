@@ -151,6 +151,25 @@ def generate_experiment_plan(
     dict
         ``{"plan": str, "compound": dict, "route": dict}``
     """
+    yield_text = str((route or {}).get("yield") or "未记录").strip()
+    if yield_text.replace(".", "", 1).isdigit():
+        yield_text += "%"
+    if not (os.getenv("DEEPSEEK_API_KEY") or "").strip():
+        if not route:
+            return {"plan": "", "error": "请先选择一条反应记录，再生成离线草案。"}
+        fields = [("反应式", "equation"), ("记录温度", "temperature"),
+                  ("记录时间", "time"), ("记录溶剂", "solvent"), ("记录催化剂", "catalyst")]
+        body = [
+            "## 路线记录草案（离线整理）",
+            f"目标：{compound.get('name') or '未提供'}",
+            *(f"- {label}：{route.get(key) or '未记录'}" for label, key in fields),
+            f"- 记录收率：{yield_text}",
+            f"- 来源：{literature_context or route.get('literature_title') or '未记录，需查证'}",
+            "", "待核对：逐项比较记录值与实验室限制；用量、操作步骤及安全要求须查阅原始文献。",
+        ]
+        return {"plan": "\n".join(body), "mode": "offline_record", "error": None,
+                "compound": compound, "route": route}
+
     # 构建上下文
     parts = [
         f"## 目标化合物",
@@ -171,7 +190,7 @@ def generate_experiment_plan(
         parts.append(f"溶剂: {route.get('solvent', '需实验确定')}")
         parts.append(f"温度: {route.get('temperature', '需实验确定')}")
         parts.append(f"时间: {route.get('time', '需实验确定')}")
-        parts.append(f"收率: {route.get('yield', '未知')}%")
+        parts.append(f"收率: {yield_text}")
 
         # 评分信息
         if any(k in route for k in ('difficulty', 'safety', 'eco', 'cost')):

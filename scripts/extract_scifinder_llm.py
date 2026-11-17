@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -61,7 +62,7 @@ logger = logging.getLogger("scifinder_llm")
 # ---------------------------------------------------------------------------
 
 
-def extract_text_from_pdf(pdf_path: str) -> str:
+def extract_text_from_pdf(pdf_path: str, deduplicate: bool = True) -> str:
     """用 pdfplumber 提取 PDF 全文。"""
     try:
         import pdfplumber
@@ -70,35 +71,13 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         sys.exit(1)
 
     with pdfplumber.open(pdf_path) as pdf:
-        raw = ""
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                raw += text + "\n"
-    return raw
+        return "\n".join(extract_page_text(page, deduplicate) for page in pdf.pages)
 
 
-def dedup_sci_finder_text(text: str) -> str:
-    """修复 SciFinder PDF 的字符重复问题。
-
-    SciFinder 导出的 PDF 中，字母常被重复一次：
-        CAS → CCAASS, Yield → YYiieelldd, Scheme → SScchheemmee
-    本函数将连续相同字符（非空白/标点）合并为一个。
-    """
-    # 需要保留重复的标点符号
-    KEEP_DUP = set(" \n\t\r,;:.()[]{}<>!?\"'|=+-*/\\@#$%^&_~")
-
-    result: list[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        result.append(ch)
-        # 如果下一个字符相同且不属于保留集，跳过一个
-        if i + 1 < n and text[i + 1] == ch and ch not in KEEP_DUP:
-            i += 1  # skip duplicate
-        i += 1
-    return "".join(result)
+def extract_page_text(page, deduplicate: bool = True) -> str:
+    """Remove overprinted glyphs at the same coordinates, preserving adjacent digits."""
+    layer = page.dedupe_chars(tolerance=1) if deduplicate else page
+    return layer.extract_text() or ""
 
 
 def split_into_schemes(text: str) -> list[tuple[int, str]]:
@@ -222,6 +201,18 @@ SYSTEM_PROMPT = """你是一名专业的化学信息学数据库工程师。
 5. JSON 格式合法
 """
 
+COMPACT_SYSTEM_PROMPT = """你是一名专业的化学信息提取助手。
+
+从给定的 SciFinder 反应记录中提取结构化数据，只返回合法 JSON：
+{"reactions":[{"reaction_id":"","title":"","authors":"","source":"","reactants":[],"products":[],"reaction_type":"","yield":"","conditions":{"reagents":[],"catalysts":[],"solvents":[],"temperature":"","time":"","pressure":"","ph":"","atmosphere":""}}]}
+
+规则：
+- 仅提取文本明确提供的内容；结构图未转成文字时，相应 reactants/products 留空数组，不要猜测。
+- 保留原化学名称。reaction_id 原样保留。
+- 不输出 procedure、workup、purification 或解释文字。
+- 不要漏掉本批文本中的反应记录；不要添加文本之外的记录。
+"""
+
 
 # ---------------------------------------------------------------------------
 # LLM 提取
@@ -234,8 +225,51 @@ def extract_scheme_with_llm(
     scheme_text: str,
     model: str,
     max_retries: int = 2,
+    compact: bool = False,
 ) -> list[dict[str, Any]] | None:
     """调用 LLM 从单个 Scheme 文本中提取结构化反应数据（返回 reactions 列表）。"""
+    if compact:
+        # Split at CAS record boundaries so large schemes do not produce
+        # oversized JSON responses. Compact mode omits long procedure text.
+        matches = list(re.finditer(r"\b\d+(?:-+\d+)*-+CAS-+\d+\b", scheme_text, re.I))
+        if matches:
+            reaction_blocks = [
+                scheme_text[
+                    match.start() : matches[index + 1].start()
+                    if index + 1 < len(matches)
+                    else len(scheme_text)
+                ].strip()
+                for index, match in enumerate(matches)
+            ]
+            extracted: list[dict[str, Any]] = []
+            batch_size = 20
+            for start in range(0, len(reaction_blocks), batch_size):
+                batch = reaction_blocks[start : start + batch_size]
+                result = _call_llm(
+                    client,
+                    model,
+                    scheme_num,
+                    "\n".join(batch),
+                    8000,
+                    f"本批包含 {len(batch)} 条反应记录。",
+                    max_retries,
+                    system_prompt=COMPACT_SYSTEM_PROMPT,
+                )
+                if result:
+                    extracted.extend(result)
+            return extracted or None
+
+        return _call_llm(
+            client,
+            model,
+            scheme_num,
+            scheme_text[:12000],
+            8000,
+            "",
+            max_retries,
+            system_prompt=COMPACT_SYSTEM_PROMPT,
+        )
+
     # 预估反应数量（决定 token 分配和文本截断策略）
     rc_match = re.search(r"\((\d+)\s*Reactions?\)", scheme_text, re.I)
     reaction_count = int(rc_match.group(1)) if rc_match else 1
@@ -301,6 +335,7 @@ def _call_llm(
     max_tokens: int,
     hint: str,
     max_retries: int = 2,
+    system_prompt: str = SYSTEM_PROMPT,
 ) -> list[dict[str, Any]] | None:
     """单次 LLM 调用，含重试。"""
     user_prompt = (
@@ -315,7 +350,7 @@ def _call_llm(
                 temperature=0.1,
                 max_tokens=max_tokens,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 response_format={"type": "json_object"},
@@ -429,83 +464,48 @@ def import_to_database(
     scheme_overviews: dict[int, dict[str, Any]],
     pdf_path: str,
 ) -> tuple[int, int]:
-    """将提取结果导入 ChemRoute 数据库（Scheme + ReactionRecord 父子结构）。"""
+    """将提取结果导入当前 reactions.db 模型。"""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-    from sqlmodel import Session
-    from app.database import engine
-    from app.chemistry.models import Scheme, ReactionRecord
+    from app.chemistry.scifinder_import import import_reviewed_reactions
 
-    added_s = 0
-    added_r = 0
+    path = Path(pdf_path)
+    source_bytes = path.read_bytes() if path.is_file() else pdf_path.encode("utf-8")
+    normalized_reactions = []
+    for reaction in reactions:
+        normalized = dict(reaction)
+        normalized["scheme_number"] = max(1, int(normalized.pop("_scheme_num", 1) or 1))
+        normalized.setdefault("page", 1)
+        normalized_reactions.append(normalized)
 
-    # 按 _scheme_num 分组
-    groups: dict[int, list[dict[str, Any]]] = {}
-    for r in reactions:
-        sn = r.get("_scheme_num", 0)
-        groups.setdefault(sn, []).append(r)
+    normalized_schemes = []
+    for scheme_number, overview in scheme_overviews.items():
+        yield_min = overview.get("yield_min")
+        yield_max = overview.get("yield_max")
+        overall_yield = None
+        if yield_min is not None:
+            overall_yield = f"{yield_min}%" if yield_max in (None, yield_min) else f"{yield_min}-{yield_max}%"
+        normalized_schemes.append({
+            "scheme_number": max(1, int(scheme_number)),
+            "reaction_count": overview.get("reaction_count", 1),
+            "overall_steps": overview.get("steps"),
+            "overall_yield": overall_yield,
+            "page_start": 1,
+            "page_end": 1,
+        })
 
-    with Session(engine) as session:
-        for scheme_num, recs in sorted(groups.items()):
-            overview = scheme_overviews.get(scheme_num, {})
-
-            # 创建 Scheme（父级）
-            scheme = Scheme(
-                scheme_num=scheme_num,
-                title=(recs[0].get("title", "") or f"Scheme {scheme_num}")[:500],
-                reaction_count=overview.get("reaction_count", len(recs)),
-                steps=overview.get("steps"),
-                yield_min=float(overview["yield_min"]) if overview.get("yield_min") is not None else None,
-                yield_max=float(overview["yield_max"]) if overview.get("yield_max") is not None else None,
-                source="scifinder_llm",
-                pdf_path=pdf_path,
-            )
-            session.add(scheme)
-            session.flush()
-            added_s += 1
-
-            # 创建 ReactionRecord（子级）
-            for r in recs:
-                cond = r.get("conditions") or {}
-
-                # 解析 yield
-                yield_str = r.get("yield", "")
-                yield_val = None
-                if yield_str:
-                    m = re.search(r"(\d+(?:\.\d+)?)", str(yield_str))
-                    if m:
-                        yield_val = float(m.group(1))
-
-                rec = ReactionRecord(
-                    scheme_id=scheme.id,
-                    reaction_id=r.get("reaction_id") or None,
-                    title=r.get("title") or None,
-                    authors=r.get("authors") or None,
-                    source=r.get("source") or None,
-                    reaction_type=r.get("reaction_type") or None,
-                    reactants=json.dumps(r.get("reactants") or []) if r.get("reactants") else None,
-                    products=json.dumps(r.get("products") or []) if r.get("products") else None,
-                    yield_text=yield_str or None,
-                    yield_percent=yield_val,
-                    conditions_json=json.dumps(cond) if cond else None,
-                    catalysts=json.dumps(cond.get("catalysts") or []) if cond.get("catalysts") else None,
-                    solvents=json.dumps(cond.get("solvents") or []) if cond.get("solvents") else None,
-                    reagents=json.dumps(cond.get("reagents") or []) if cond.get("reagents") else None,
-                    temperature=cond.get("temperature") or None,
-                    time=cond.get("time") or None,
-                    pressure=cond.get("pressure") or None,
-                    ph=cond.get("ph") or None,
-                    atmosphere=cond.get("atmosphere") or None,
-                    procedure=r.get("procedure") or None,
-                    workup=r.get("workup") or None,
-                    purification=r.get("purification") or None,
-                )
-                session.add(rec)
-                added_r += 1
-
-        session.commit()
-
-    return added_s, added_r
+    result = import_reviewed_reactions(
+        reactions=normalized_reactions,
+        schemes=normalized_schemes,
+        file_name=path.name,
+        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+        page_count=1,
+        model_used=os.getenv("LLM_MODEL", "deepseek-chat"),
+    )
+    if result["duplicate"]:
+        logger.info("该 PDF 已经导入，跳过重复记录")
+        return 0, 0
+    return result["schemes_imported"], result["reactions_imported"]
 
 
 # ---------------------------------------------------------------------------
@@ -576,17 +576,8 @@ def main() -> None:
 
     # ---- 提取文本 ----
     logger.info("正在提取 PDF 文本: %s", pdf_path)
-    raw_text = extract_text_from_pdf(str(pdf_path))
-    logger.info("原始文本长度: %d 字符", len(raw_text))
-
-    # ---- 字符去重 ----
-    if not args.skip_dedup:
-        logger.info("正在修复 SciFinder 字符重复...")
-        text = dedup_sci_finder_text(raw_text)
-        logger.info("去重后文本长度: %d 字符（减少 %.0f%%）",
-                     len(text), (1 - len(text) / len(raw_text)) * 100)
-    else:
-        text = raw_text
+    text = extract_text_from_pdf(str(pdf_path), deduplicate=not args.skip_dedup)
+    logger.info("提取文本长度: %d 字符", len(text))
 
     # ---- 按 Scheme 分块 ----
     schemes = split_into_schemes(text)
@@ -672,7 +663,7 @@ def main() -> None:
         logger.info("正在导入数据库...")
         try:
             s_count, r_count = import_to_database(all_reactions, scheme_overviews, str(pdf_path))
-            logger.info("导入完成: %d Scheme + %d ReactionRecord", s_count, r_count)
+            logger.info("导入完成: %d Scheme + %d Reaction", s_count, r_count)
         except Exception as exc:
             logger.error("数据库导入失败: %s", exc)
             sys.exit(1)

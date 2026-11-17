@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -15,13 +17,8 @@ from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from app.chemistry.models import Reaction, Scheme, Literature, ReactionCondition, ReactionEquation
-from app.chemistry.scoring import (
-    score_reaction,
-    extract_temperature_celsius,
-    has_workup,
-    extract_time_hours,
-    _parse_yield,
-)
+from app.chemistry.constraints import evaluate_constraints
+from app.chemistry.scoring import score_reaction
 from app.database import chemistry_engine
 
 load_dotenv()
@@ -32,6 +29,39 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _client: Optional[OpenAI] = None
+
+
+def _source_details(raw):
+    """Keep old records with free-form extraction text readable."""
+    if not raw or not any(key in raw for key in ('"source_refs"', '"paper_evidence"')):
+        return {"source_refs": []}
+    try:
+        record = json.loads(raw)
+    except (ValueError, TypeError):
+        return {"source_refs": []}
+    if not isinstance(record, dict):
+        return {"source_refs": []}
+    links = record.get("source_refs") or []
+    refs = [{"label": ref["label"], "url": ref["url"]} for ref in links
+            if isinstance(ref, dict) and isinstance(ref.get("label"), str)
+            and isinstance(ref.get("url"), str) and ref["url"].startswith("https://")] if isinstance(links, list) else []
+    evidence = record.get("paper_evidence")
+    return {"source_refs": refs, "paper_evidence": evidence if isinstance(evidence, list) else [],
+            "source_file": record.get("source_file")}
+
+
+def _equation_sides(equation: Optional[str]) -> tuple[str, str]:
+    """Return reactant and product sides, excluding the condition block."""
+    if not equation or ">>" not in equation:
+        return "", ""
+    left, right = equation.split(">>", 1)
+    left = re.sub(r"\s*\(\[.*$", "", left, flags=re.DOTALL).strip()
+    right = re.sub(r"\s*\(\[.*$", "", right, flags=re.DOTALL).strip()
+    return left, right
+
+
+def _contains_value(haystack: Optional[str], needle: str) -> bool:
+    return bool(haystack and needle.casefold() in haystack.casefold())
 
 
 def _get_llm() -> OpenAI:
@@ -144,6 +174,8 @@ def analyze_target(
                     Reaction.products_zh.contains(query),
                     Reaction.reactants_en.contains(query),
                     Reaction.products_en.contains(query),
+                    Reaction.reactant_smiles == query,
+                    Reaction.product_smiles == query,
                     Reaction.id.in_(eq_matched_ids),
                 )
             ).limit(30)
@@ -157,21 +189,41 @@ def analyze_target(
                 ).limit(10)
             ).all()
 
+        equation_by_reaction = {}
+        reaction_ids = [reaction.id for reaction in reactions if reaction.id is not None]
+        if reaction_ids:
+            equation_rows = session.exec(
+                select(ReactionEquation).where(
+                    ReactionEquation.reaction_id.in_(reaction_ids)
+                )
+            ).all()
+            equation_by_reaction = {eq.reaction_id: eq for eq in equation_rows}
+
         # When the user supplies a starting material, keep only records whose
-        # reactant names or structures contain it. The match is intentionally
-        # transparent substring matching; it is not a graph/path prediction.
+        # reactant names or structures contain it. Equation sides are used as
+        # a fallback because imported SciFinder records often have names only
+        # in reaction_equations, not in the Reaction text columns.
         if starting_material:
-            source_key = starting_material.casefold()
             reactant_fields = (
                 "reactants_text", "reactants_zh", "reactants_en", "reactant_smiles",
             )
-            reactions = [
-                reaction for reaction in reactions
-                if any(
-                    source_key in (getattr(reaction, field, None) or "").casefold()
+            filtered_reactions = []
+            for reaction in reactions:
+                field_match = any(
+                    _contains_value(getattr(reaction, field, None), starting_material)
                     for field in reactant_fields
                 )
-            ]
+                equation = equation_by_reaction.get(reaction.id)
+                equation_match = False
+                if equation:
+                    for equation_text in (equation.equation_zh, equation.equation):
+                        reactant_side, _ = _equation_sides(equation_text)
+                        if _contains_value(reactant_side, starting_material):
+                            equation_match = True
+                            break
+                if field_match or equation_match:
+                    filtered_reactions.append(reaction)
+            reactions = filtered_reactions
 
         # 构建结果
         reaction_list = []
@@ -217,25 +269,29 @@ def analyze_target(
                 )
             ).all()
 
-            # 获取方程式（reaction_equations 表）
-            eq = session.exec(
-                select(ReactionEquation).where(
-                    ReactionEquation.reaction_id == r.id
-                )
-            ).first()
+            # 方程式是许多导入记录中唯一保存名称和结构的字段。
+            eq = equation_by_reaction.get(r.id)
+            equation_zh = eq.equation_zh if eq else None
+            equation = eq.equation if eq else None
+            reactants_zh, products_zh = _equation_sides(equation_zh)
+            reactants_smiles, products_smiles = _equation_sides(equation)
 
             reaction_list.append({
                 "id": r.id,
                 "scheme_id": r.scheme_id,
+                "scheme_number": scheme.scheme_number if scheme else None,
+                "source_page": r.page,
+                **_source_details(r.raw_json),
+                "literature_doi": lit.doi if lit else None,
                 "cas_registry_id": r.cas_registry_id,
                 "yield_": r.yield_,
                 "steps": r.steps,
-                "reactants_text": r.reactants_text,
-                "products_text": r.products_text,
+                "reactants_text": r.reactants_text or r.reactants_zh or r.reactants_en or reactants_zh or reactants_smiles or None,
+                "products_text": r.products_text or r.products_zh or r.products_en or products_zh or products_smiles or None,
                 "reactant_smiles": r.reactant_smiles,
                 "product_smiles": r.product_smiles,
-                "equation": eq.equation if eq else None,
-                "equation_zh": eq.equation_zh if eq else None,
+                "equation": equation,
+                "equation_zh": equation_zh,
                 "conditions_summary": [{
                     "step": c.step_number,
                     "reagents": c.reagents,
@@ -287,77 +343,16 @@ def analyze_target(
             ranked: list[dict] = []
 
             for item in reaction_list:
-                conds = item.get("conditions_summary") or []
-
-                # 提取各维度的实际值
-                yield_val = _parse_yield(item.get("yield_"))
-                steps_val = item.get("steps") or 1
-                temp_vals = [
-                    extract_temperature_celsius(c.get("temperature"))
-                    for c in conds
-                ]
-                temp_vals = [v for v in temp_vals if v is not None]
-                temp_val = max(temp_vals) if temp_vals else None
-                time_vals = [extract_time_hours(c.get("time")) for c in conds]
-                time_vals = [v for v in time_vals if v is not None]
-                time_val = max(time_vals) if time_vals else None
-                catalyst_val = any((c.get("catalysts") or "").strip() for c in conds)
-                solvent_val = any((c.get("solvents") or "").strip() for c in conds)
-                workup_val = any(has_workup(c.get("other")) for c in conds)
-
-                # 合并所有条件的催化剂/溶剂名称（供展示与关键词匹配）
-                catalyst_text = "; ".join(
-                    (c.get("catalysts") or "").strip()
-                    for c in conds
-                    if (c.get("catalysts") or "").strip()
-                )
-                solvent_text = "; ".join(
-                    (c.get("solvents") or "").strip()
-                    for c in conds
-                    if (c.get("solvents") or "").strip()
-                )
-
-                # 各条件满足判定（仅对激活的条件计数）
-                matched = 0
-                if min_yield is not None:
-                    matched += int(yield_val >= min_yield)
-                if max_steps is not None:
-                    matched += int(steps_val <= max_steps)
-                if max_temperature is not None:
-                    matched += int(temp_val is not None and temp_val <= max_temperature)
-                if max_time_hours is not None:
-                    matched += int(time_val is not None and time_val <= max_time_hours)
-                if catalyst_pref not in (None, "any"):
-                    matched += int((catalyst_pref == "with") == catalyst_val)
-                if workup_pref not in (None, "any"):
-                    matched += int((workup_pref == "with") == workup_val)
-                if solvent_pref not in (None, "any"):
-                    matched += int((solvent_pref == "with") == solvent_val)
-                if catalyst_name:
-                    matched += int(catalyst_name.lower() in catalyst_text.lower())
-                if solvent_name:
-                    matched += int(solvent_name.lower() in solvent_text.lower())
                 score = score_map.get(item["id"])
-
                 ranked.append({
                     **item,
-                    "yield_val": round(yield_val, 1),
-                    "steps_val": steps_val,
-                    "temp_val": round(temp_val, 1) if temp_val is not None else None,
-                    "time_val": round(time_val, 2) if time_val is not None else None,
-                    "catalyst_val": catalyst_val,
-                    "workup_val": workup_val,
-                    "solvent_val": solvent_val,
-                    "catalyst_names": catalyst_text,
-                    "solvent_names": solvent_text,
-                    "matched_conditions": matched,
-                    "exact": matched == active_conditions,
+                    **evaluate_constraints(item, filters),
                     "score": score,
                     "_total": score["total"] if score else 0.0,
                 })
 
             # 排序：先满足条件数，再总分
-            ranked.sort(key=lambda x: (-x["matched_conditions"], -x["_total"]))
+            ranked.sort(key=lambda x: (-x["matched_conditions"], -x["_total"], x["id"]))
             top_items = ranked[:top_n]
             for it in top_items:
                 it.pop("_total", None)
@@ -386,13 +381,21 @@ def analyze_target(
     for r in reaction_list:
         products = r.get("products_text") or ""
         reactants = r.get("reactants_text") or ""
-        if query and query.lower() in products.lower():
+        product_matches = any(
+            _contains_value(value, query)
+            for value in (products, r.get("product_smiles"))
+        )
+        reactant_matches = any(
+            _contains_value(value, query)
+            for value in (reactants, r.get("reactant_smiles"))
+        )
+        if query and product_matches:
             upstream.append({
                 "compound": reactants or "（未知原料）",
                 "reaction": f"{reactants} → {products}" if reactants else f"→ {products}",
                 "reaction_id": r["id"],
             })
-        if query and query.lower() in reactants.lower():
+        if query and reactant_matches:
             downstream.append({
                 "compound": products or "（未知产物）",
                 "reaction": f"{reactants} → {products}" if products else f"{reactants} →",
@@ -401,7 +404,9 @@ def analyze_target(
 
     # LLM 分析（可选）
     answer = ""
-    if reaction_list:
+    if reaction_list and not (os.getenv("DEEPSEEK_API_KEY") or "").strip():
+        answer = "未配置模型密钥；已完成本地路线评分，可比较条件并导出记录草案。"
+    elif reaction_list:
         try:
             answer = _generate_llm_response(query, reaction_list, scored, literature_sources)
         except Exception as exc:
@@ -425,7 +430,7 @@ def analyze_target(
         },
         "upstream": upstream,
         "downstream": downstream,
-        "scored": scored[:10],
+        "scored": scored,
         "filter_matches": filter_matches,
         "answer": answer,
     }

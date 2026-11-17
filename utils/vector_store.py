@@ -12,24 +12,10 @@ Both functions share the same embedding model and Chroma collection.
 import os
 from pathlib import Path
 
-import chromadb
-from sentence_transformers import SentenceTransformer
+from utils.rag_resources import get_collection, get_embedding_model
 
 from utils.document_loader import load_documents
 from utils.text_splitter import split_text
-
-# ---------------------------------------------------------------------------
-# Shared resources
-# ---------------------------------------------------------------------------
-
-model = SentenceTransformer(
-    "BAAI/bge-base-zh-v1.5",
-    local_files_only=True,
-)
-
-client = chromadb.PersistentClient(path="vector_db")
-collection = client.get_or_create_collection("knowledge")
-
 
 # ---------------------------------------------------------------------------
 # Full rebuild
@@ -38,9 +24,9 @@ collection = client.get_or_create_collection("knowledge")
 def build_vector_store() -> None:
     """Wipe the collection and re-index every document under ``documents/``."""
 
-    old = collection.get()
+    old = get_collection().get()
     if old["ids"]:
-        collection.delete(ids=old["ids"])
+        get_collection().delete(ids=old["ids"])
 
     documents = load_documents()
     print("读取文档数量:", len(documents))
@@ -62,9 +48,9 @@ def sync_system_documents(folder_path: str = "documents") -> int:
     editing files in ``documents/`` and replaces the previous all-or-nothing
     rebuild workflow for system knowledge.
     """
-    old = collection.get(where={"user_id": "system"})
+    old = get_collection().get(where={"user_id": "system"})
     if old["ids"]:
-        collection.delete(ids=old["ids"])
+        get_collection().delete(ids=old["ids"])
 
     documents = load_documents(folder_path)
     chunks = split_text(documents)
@@ -115,7 +101,7 @@ def add_file_to_store(filepath: str, filename: str, user_id: int) -> int:
 def _index_chunks(chunks: list[dict]) -> None:
     """Embed and add a list of chunks to the Chroma collection."""
     texts = [chunk["text"] for chunk in chunks]
-    vectors = model.encode(texts, normalize_embeddings=True).tolist()
+    vectors = get_embedding_model().encode(texts, normalize_embeddings=True).tolist()
 
     ids = []
     metadatas = []
@@ -132,7 +118,7 @@ def _index_chunks(chunks: list[dict]) -> None:
             }
         )
 
-    collection.add(ids=ids, documents=texts, embeddings=vectors, metadatas=metadatas)
+    get_collection().add(ids=ids, documents=texts, embeddings=vectors, metadatas=metadatas)
     print(f"向量库已添加 {len(chunks)} 个切片")
 
 
@@ -145,7 +131,7 @@ def _next_chunk_id(chunk: dict) -> str:
 def _remove_by_stored_filename(stored_filename: str, user_id: str) -> None:
     """Delete all vectors matching a stored filename + user_id."""
     try:
-        collection.delete(
+        get_collection().delete(
             where={
                 "stored_filename": stored_filename,
                 "user_id": user_id,

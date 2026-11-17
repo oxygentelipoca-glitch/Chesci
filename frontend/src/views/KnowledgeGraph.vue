@@ -1,7 +1,8 @@
 <script setup>
-import { ref, onMounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
 import { getGraph, getReactions } from '../api/chemistry.js'
+import MainLayout from '../layouts/MainLayout.vue'
 
 const chartRef = ref(null)
 const selected = ref(null)
@@ -9,228 +10,402 @@ const empty = ref(false)
 const searchQuery = ref('')
 const allNodes = ref([])
 const allLinks = ref([])
-let chart = null
-
+const visibleLinks = ref([])
+const noSearchResult = ref(false)
+const showAllNodes = ref(false)
+const showConditions = ref(false)
+const viewSummary = ref('正在加载图谱…')
 const reactions = ref([])
+let chart = null
+let resizeObserver = null
+
+const coreCategories = new Set(['reactant', 'product', 'both'])
+const categoryLabels = {
+  reactant: '反应物',
+  product: '产物',
+  both: '反应物 / 产物',
+  catalyst: '催化剂',
+  solvent: '溶剂',
+}
+const visibleRelationCount = computed(() => visibleLinks.value.length)
+
+function aggregateLinks(links) {
+  const groups = new Map()
+  for (const link of links) {
+    const key = `${link.category || 'reaction'}:${link.source}->${link.target}`
+    let group = groups.get(key)
+    if (!group) {
+      group = {
+        source: link.source,
+        target: link.target,
+        category: link.category || 'reaction',
+        reactionIds: new Set(),
+        rawCount: 0,
+      }
+      groups.set(key, group)
+    }
+    group.rawCount += 1
+    if (link.reaction_id != null) group.reactionIds.add(link.reaction_id)
+  }
+  return [...groups.values()].map(group => ({
+    source: group.source,
+    target: group.target,
+    category: group.category,
+    reaction_count: group.reactionIds.size || group.rawCount,
+  }))
+}
+
+function focusedGraph(query) {
+  const matches = allNodes.value
+    .filter(node => String(node.name || '').toLocaleLowerCase().includes(query))
+    .sort((a, b) => (b.reaction_count || 0) - (a.reaction_count || 0))
+  if (!matches.length) return { nodes: [], links: [], highlights: [], matchedCount: 0 }
+
+  const focusNodes = matches.slice(0, 12)
+  const focusIds = new Set(focusNodes.map(node => node.id))
+  const catalystFocus = focusNodes.some(node => node.category === 'catalyst')
+    && !focusNodes.some(node => coreCategories.has(node.category))
+  const candidateLinks = aggregateLinks(allLinks.value.filter(link =>
+    link.category === 'reaction'
+    || ((showConditions.value || catalystFocus) && link.category === 'catalysis')
+  ))
+
+  const neighborWeight = new Map()
+  for (const link of candidateLinks) {
+    if (focusIds.has(link.source)) {
+      neighborWeight.set(link.target, (neighborWeight.get(link.target) || 0) + link.reaction_count)
+    }
+    if (focusIds.has(link.target)) {
+      neighborWeight.set(link.source, (neighborWeight.get(link.source) || 0) + link.reaction_count)
+    }
+  }
+  const neighborIds = [...neighborWeight.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, (chartRef.value?.clientWidth || window.innerWidth) < 540 ? 8 : 16)
+    .map(([id]) => id)
+  const visibleIds = new Set([...focusIds, ...neighborIds])
+  const nodes = allNodes.value.filter(node => visibleIds.has(node.id))
+  const links = candidateLinks.filter(link =>
+    visibleIds.has(link.source)
+    && visibleIds.has(link.target)
+    && (focusIds.has(link.source) || focusIds.has(link.target))
+  )
+  return { nodes, links, highlights: [...focusIds], matchedCount: matches.length }
+}
+
+function overviewGraph() {
+  const coreNodes = allNodes.value.filter(node => coreCategories.has(node.category))
+  const reactionLinks = aggregateLinks(allLinks.value.filter(link => link.category === 'reaction'))
+  const degree = new Map(coreNodes.map(node => [node.id, 0]))
+  for (const link of reactionLinks) {
+    degree.set(link.source, (degree.get(link.source) || 0) + 1)
+    degree.set(link.target, (degree.get(link.target) || 0) + 1)
+  }
+  const rankedNodes = coreNodes
+    .filter(node => degree.get(node.id) > 0)
+    .sort((a, b) => (degree.get(b.id) - degree.get(a.id))
+      || ((b.reaction_count || 0) - (a.reaction_count || 0)))
+  const defaultLimit = (chartRef.value?.clientWidth || window.innerWidth) < 540 ? 10 : 18
+  const mainNodes = showAllNodes.value ? rankedNodes : rankedNodes.slice(0, defaultLimit)
+  const mainIds = new Set(mainNodes.map(node => node.id))
+  const nodes = [...mainNodes]
+  const links = reactionLinks.filter(link => mainIds.has(link.source) && mainIds.has(link.target))
+
+  if (showConditions.value) {
+    const conditionLinks = aggregateLinks(allLinks.value.filter(link => link.category === 'catalysis'))
+      .filter(link => mainIds.has(link.target))
+    const catalystWeight = new Map()
+    for (const link of conditionLinks) {
+      catalystWeight.set(link.source, (catalystWeight.get(link.source) || 0) + link.reaction_count)
+    }
+    const catalystIds = new Set([...catalystWeight.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, showAllNodes.value ? 18 : 10)
+      .map(([id]) => id))
+    nodes.push(...allNodes.value.filter(node => catalystIds.has(node.id)))
+    links.push(...conditionLinks.filter(link => catalystIds.has(link.source)))
+  }
+  return { nodes, links, highlights: [] }
+}
+
+function updateGraph() {
+  if (!allNodes.value.length) return
+  const query = searchQuery.value.trim().toLocaleLowerCase()
+  noSearchResult.value = false
+  selected.value = null
+  const graph = query ? focusedGraph(query) : overviewGraph()
+  visibleLinks.value = graph.links
+  noSearchResult.value = Boolean(query) && graph.matchedCount === 0
+
+  if (query) {
+    viewSummary.value = graph.matchedCount
+      ? `${graph.matchedCount > 12 ? '显示前 12 个匹配项 · ' : ''}${graph.nodes.length} 个节点 · ${graph.links.length} 条关联`
+      : '没有匹配的化合物'
+  } else {
+    const mode = showAllNodes.value ? '全部反应网络' : '重点网络'
+    viewSummary.value = `${mode} · ${graph.nodes.length} 个节点 · ${graph.links.length} 条合并关系 · 数据库 ${allNodes.value.length} 节点`
+  }
+  renderGraph(graph.nodes, graph.links, Boolean(query), graph.highlights)
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[char])
+}
+
+function renderGraph(nodes, links, isFocused, highlights = []) {
+  if (!chartRef.value) return
+  const compact = chartRef.value.clientWidth < 540
+  if (chart) chart.dispose()
+  chart = echarts.init(chartRef.value)
+  const categoryNames = [...new Set(nodes.map(node => categoryLabels[node.category]).filter(Boolean))]
+  const categoryIndex = Object.fromEntries(categoryNames.map((name, index) => [name, index]))
+  const colors = { reactant: '#65A9BA', product: '#16806A', both: '#497FA3', catalyst: '#C18A48' }
+  const nodeNameById = new Map(nodes.map(node => [node.id, node.name]))
+  const graphNodes = nodes.map(node => {
+    const categoryName = categoryLabels[node.category] || '反应物'
+    const isHighlight = highlights.includes(node.id)
+    const count = Math.max(1, node.reaction_count || 1)
+    return {
+      ...node,
+      category: categoryIndex[categoryName] ?? 0,
+      symbolSize: Math.min(42, 22 + Math.log2(count + 1) * 3),
+      itemStyle: {
+        color: colors[node.category] || colors.reactant,
+        borderColor: isHighlight ? '#E5A23B' : '#fff',
+        borderWidth: isHighlight ? 3 : 1.5,
+        shadowBlur: isHighlight ? 12 : 3,
+        shadowColor: isHighlight ? 'rgba(229,162,59,.28)' : 'rgba(20,40,60,.10)',
+      },
+      label: {
+        show: true, position: 'right', distance: 6,
+        color: '#344054', fontSize: compact ? 10 : (isFocused ? 12 : 11),
+        formatter: params => params.name.length > (compact ? 12 : 16)
+          ? `${params.name.slice(0, compact ? 11 : 15)}…`
+          : params.name,
+      },
+    }
+  })
+  const graphLinks = links.map(link => ({
+    ...link,
+    label: { show: false },
+    lineStyle: {
+      color: link.category === 'catalysis' ? '#C9A36B' : '#91A9B8',
+      width: Math.min(4, 1.2 + Math.log2((link.reaction_count || 1) + 1) * 0.45),
+      opacity: link.category === 'catalysis' ? 0.5 : 0.62,
+      curveness: 0.06,
+    },
+  }))
+
+  chart.setOption({
+    backgroundColor: '#fff',
+    animationDuration: 450,
+    tooltip: {
+      trigger: 'item',
+      confine: true,
+      formatter: params => {
+        if (params.dataType === 'node') {
+          const category = categoryNames[params.data.category] || '化合物'
+          return `<div style="font-weight:700">${escapeHtml(params.name)}</div>`
+            + `<div>${escapeHtml(category)} · 出现 ${Number(params.data.reaction_count || 1)} 次</div>`
+        }
+        const source = nodeNameById.get(params.data.source) || params.data.source
+        const target = nodeNameById.get(params.data.target) || params.data.target
+        const relation = params.data.category === 'catalysis' ? '催化关系' : '反应关系'
+        return `<div style="font-weight:700">${escapeHtml(source)} → ${escapeHtml(target)}</div>`
+          + `<div>${relation} · ${params.data.reaction_count || 1} 条反应记录</div>`
+      },
+    },
+    legend: {
+      top: 10, left: 12, data: categoryNames,
+      textStyle: { fontSize: 11, color: '#667085' }, itemWidth: 10, itemHeight: 10,
+    },
+    series: [{
+      type: 'graph', layout: 'force', roam: true, draggable: true,
+      left: 18, right: 32, top: 42, bottom: 40,
+      zoom: isFocused ? 1.08 : 1,
+      scaleLimit: { min: 0.45, max: 3.2 },
+      force: {
+        repulsion: compact ? 180 : (isFocused ? 340 : 260),
+        gravity: 0.08,
+        edgeLength: compact ? [75, 115] : (isFocused ? [115, 170] : [100, 155]),
+        friction: 0.62,
+        layoutAnimation: true,
+      },
+      data: graphNodes, links: graphLinks,
+      categories: categoryNames.map(name => ({ name })),
+      label: { show: true }, labelLayout: { hideOverlap: true },
+      edgeLabel: { show: false },
+      edgeSymbol: ['none', 'arrow'], edgeSymbolSize: [0, 7],
+      emphasis: {
+        focus: 'adjacency', scale: 1.12,
+        label: { show: true, fontSize: 13, fontWeight: 600 },
+        lineStyle: { width: 3, opacity: 0.9 },
+      },
+      lineStyle: { opacity: 0.6 },
+    }],
+  }, { notMerge: true })
+
+  chart.off('click')
+  chart.on('click', params => {
+    if (params.dataType === 'node') {
+      selected.value = allNodes.value.find(node => node.id === params.data.id) || params.data
+    }
+  })
+  if (!resizeObserver) {
+    resizeObserver = new ResizeObserver(() => chart?.resize())
+    resizeObserver.observe(chartRef.value)
+  }
+}
+
+watch([searchQuery, showAllNodes, showConditions], updateGraph)
 
 onMounted(async () => {
   try {
     const data = await getGraph()
     if (!data.nodes?.length) { empty.value = true; return }
     allNodes.value = data.nodes
-    allLinks.value = data.links
+    allLinks.value = data.links || []
     await nextTick()
-    renderGraph(data.nodes, data.links, false)
-  } catch (e) { empty.value = true }
-
-  // 加载反应列表
+    updateGraph()
+  } catch {
+    empty.value = true
+  }
   try {
-    const r2 = await getReactions({ limit: 200 })
-    reactions.value = (r2.items || r2.reactions || [])
-  } catch (e) {}
+    const result = await getReactions({ limit: 200 })
+    reactions.value = result.items || result.reactions || []
+  } catch {
+    reactions.value = []
+  }
 })
 
-watch(searchQuery, val => {
-  if (!val.trim()) { renderGraph(allNodes.value, allLinks.value, false); return }
-  const q = val.trim().toLowerCase()
-  const matchedIds = new Set()
-  allNodes.value.forEach(n => { if (n.name.toLowerCase().includes(q)) matchedIds.add(n.id) })
-  if (matchedIds.size === 0) return
-
-  // 找到匹配节点及其邻居
-  const neighborIds = new Set(matchedIds)
-  allLinks.value.forEach(l => {
-    if (matchedIds.has(l.source) || matchedIds.has(l.target)) {
-      neighborIds.add(l.source)
-      neighborIds.add(l.target)
-    }
-  })
-
-  const filteredNodes = allNodes.value.filter(n => neighborIds.has(n.id))
-  const filteredLinks = allLinks.value.filter(l => neighborIds.has(l.source) && neighborIds.has(l.target))
-  renderGraph(filteredNodes, filteredLinks, true, [...matchedIds])
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect()
+  chart?.dispose()
+  resizeObserver = null
+  chart = null
 })
-
-function renderGraph(nodes, links, isFiltered, highlightIds = []) {
-  if (!chartRef.value) return
-  if (chart) chart.dispose()
-  chart = echarts.init(chartRef.value)
-
-  const productCount = {}
-  links.forEach(l => { productCount[l.target] = (productCount[l.target] || 0) + 1 })
-  const maxProduct = Math.max(...Object.values(productCount), 1)
-
-  const categories = [
-    { name: '反应物', itemStyle: { color: '#7EB8C9' } },
-    { name: '产物', itemStyle: { color: '#065F46' } },
-    { name: '反应物/产物', itemStyle: { color: '#4A90A4' } },
-    { name: '催化剂', itemStyle: { color: '#B8A07C' } },
-    { name: '溶剂', itemStyle: { color: '#8899AA' } },
-  ]
-  const catMap = { reactant: 0, product: 1, both: 2, catalyst: 3, solvent: 4 }
-
-  const graphNodes = nodes.map(n => {
-    const cat = catMap[n.category] ?? 0
-    const size = n.symbolSize || (cat === 3 ? 18 : 32)
-    const isHighlight = highlightIds.includes(n.id)
-    return {
-      ...n, category: cat, symbolSize: isHighlight ? size + 12 : size,
-      itemStyle: isHighlight ? { borderColor: '#F59E0B', borderWidth: 3, shadowBlur: 16, shadowColor: 'rgba(245,158,11,0.4)' } : {},
-      label: { show: false },
-    }
-  })
-
-  // 统计同一 source→target 的边数，分配不同曲率避免重叠
-  const edgeGroups = {}
-  links.forEach(l => {
-    const key = `${l.source}->${l.target}`
-    if (!edgeGroups[key]) edgeGroups[key] = []
-    edgeGroups[key].push(l)
-  })
-
-  const graphLinks = []
-  Object.values(edgeGroups).forEach(group => {
-    group.forEach((l, i) => {
-      // 交替正负曲率：0.25, -0.25, 0.4, -0.4...
-      const curv = (i % 2 === 0 ? 0.25 + Math.floor(i/2) * 0.2 : -(0.25 + Math.floor(i/2) * 0.2))
-      const colors = ['#4A90A4', '#7EB8C9', '#B8A07C', '#163A5F']
-      graphLinks.push({
-        ...l,
-        label: { show: true, fontSize: 9, color: '#8899AA', formatter: l.label?.length > 6 ? l.label.slice(0,6)+'…' : l.label },
-        lineStyle: { color: colors[i % colors.length], width: 1.8, curveness: curv, opacity: 0.7 },
-      })
-    })
-  })
-
-  chart.setOption({
-    backgroundColor: '#FAFBFC',
-    animationDuration: 800,
-    tooltip: {
-      trigger: 'item',
-      formatter: p => p.dataType === 'node'
-        ? `<div style="font-weight:700;font-size:14px">${p.name}</div>`
-          + (p.data.category ? `<div style="color:#666;font-size:12px">${['反应物','产物','反应物/产物','催化剂','溶剂'][catMap[p.data.category] ?? 0]}</div>` : '')
-          + `<div style="color:#888;font-size:11px">${p.data.reaction_count || 1} 次出现</div>`
-        : `<div style="font-size:13px">${p.data.label}</div>`
-    },
-    legend: { bottom: 8, data: categories.map(c => c.name), textStyle: { fontSize: 11, color: '#6B7C93' } },
-    series: [{
-      type: 'graph', layout: 'force', roam: true, draggable: true,
-      zoom: isFiltered ? 1.2 : 0.8,
-      scaleLimit: { min: 0.2, max: 5 },
-      force: {
-        repulsion: isFiltered ? 400 : 500,
-        gravity: 0.02,
-        edgeLength: isFiltered ? [180, 320] : [220, 400],
-        friction: 0.15,
-        layoutAnimation: true,
-      },
-      data: graphNodes, links: graphLinks, categories,
-      label: { show: false },
-      edgeLabel: { show: true, fontSize: 9, distance: 8 },
-      edgeSymbol: ['none', 'arrow'], edgeSymbolSize: [0, 8],
-      emphasis: { scale: 1.3, label: { show: true, fontSize: 16, fontWeight: 700 }, lineStyle: { width: 3 } },
-      itemStyle: { borderColor: '#fff', borderWidth: 2, shadowBlur: 4, shadowColor: 'rgba(0,0,0,0.06)' },
-      lineStyle: { opacity: 0.5 },
-    }]
-  })
-
-  // 点击节点
-  chart.off('click')
-  chart.on('click', params => {
-    if (params.dataType === 'node') {
-      selected.value = allNodes.value.find(n => n.id === params.data.id) || params.data
-    }
-  })
-
-  new ResizeObserver(() => chart.resize()).observe(chartRef.value)
-}
 </script>
 
 <template>
   <MainLayout>
     <div class="kg-root">
-      <h2>知识图谱可视化</h2>
-      <p class="subtitle">搜索化合物查看关联反应 · 滚轮缩放 · 拖拽探索</p>
+      <header class="page-intro"><h1>知识图谱</h1><p>搜索一个化合物，查看与它直接相连的反应。点击节点可查看记录详情。</p></header>
 
       <div class="kg-toolbar">
-         <input v-model="searchQuery" placeholder="🔍 搜索化合物，如：Piperidine、Pyridine、Acid..." class="kg-search" />
-        <button v-if="searchQuery" class="kg-clear" @click="searchQuery = ''">✕ 清除</button>
-        <span class="kg-count">{{ searchQuery ? '筛选模式' : '全部' }} · {{ allNodes.length }} 节点 {{ allLinks.length }} 边</span>
+        <input v-model="searchQuery" placeholder="搜索化合物，如：苯甲醛、肉桂酸、Piperidine" class="kg-search" aria-label="搜索图谱中的化合物" />
+        <button v-if="searchQuery" class="kg-clear" @click="searchQuery = ''">清除搜索</button>
+        <button v-else class="kg-mode" @click="showAllNodes = !showAllNodes">
+          {{ showAllNodes ? '收起至重点网络' : '展开全部反应网络' }}
+        </button>
+        <label class="kg-toggle">
+          <input v-model="showConditions" type="checkbox" />
+          <span>显示催化关系</span>
+        </label>
+        <span class="kg-count">{{ viewSummary }}</span>
       </div>
+      <p class="kg-hint">重复的同一化合物关系已合并；悬停查看记录数，点击节点查看详情。溶剂不作为反应路径边显示。</p>
 
       <div v-if="empty" class="empty-state">
-        <p>📭 图谱数据为空</p>
-        <p class="hint">在「路线规划」中上传化学反应式后，知识图谱将自动构建</p>
+        <p>图谱暂不可用</p>
+        <p class="hint">请检查反应数据库或服务连接。</p>
       </div>
       <div v-else class="kg-layout">
-        <div class="kg-canvas" ref="chartRef"></div>
-         <div v-if="selected" class="kg-detail">
-           <h3>🧪 {{ selected.name }}</h3>
-           <table>
-             <tr><td>分类</td><td>{{ {reactant:'反应物',product:'产物',both:'反应物/产物',catalyst:'催化剂',solvent:'溶剂'}[selected.category] || selected.category }}</td></tr>
-             <tr><td>出现次数</td><td>{{ selected.reaction_count || 1 }}</td></tr>
-             <tr v-if="selected.color"><td>颜色</td><td><span :style="{display:'inline-block',width:16,height:16,borderRadius:3,background:selected.color}"></span></td></tr>
-           </table>
-           <button class="kg-focus-btn" @click="searchQuery = selected.name">🔗 聚焦此化合物</button>
+        <div class="kg-canvas-wrap">
+          <div class="kg-canvas" ref="chartRef"></div>
+          <div v-if="noSearchResult" class="kg-overlay">没有找到匹配的化合物，请检查名称或尝试英文名。</div>
+          <div v-else-if="searchQuery && !visibleRelationCount" class="kg-overlay">
+            找到该词条，但当前图谱中没有可显示的反应关系。
+          </div>
         </div>
+        <aside v-if="selected" class="kg-detail">
+          <button class="kg-detail-close" aria-label="关闭详情" @click="selected = null">×</button>
+          <span class="kg-detail-kicker">化合物详情</span>
+          <h3>{{ selected.name }}</h3>
+          <div class="kg-detail-row">
+            <span>分类</span>
+            <strong>{{ categoryLabels[selected.category] || selected.category }}</strong>
+          </div>
+          <div class="kg-detail-row">
+            <span>出现次数</span>
+            <strong>{{ selected.reaction_count || 1 }}</strong>
+          </div>
+          <button class="kg-focus-btn" @click="searchQuery = selected.name">聚焦此化合物</button>
+        </aside>
       </div>
 
-      <!-- 反应列表 -->
-      <div class="reaction-list" v-if="reactions.length">
-        <h3>📋 反应列表 ({{ reactions.length }} 条)</h3>
-        <table class="rxn-table">
-          <thead>
-            <tr>
-              <th>ID</th><th>CAS</th><th>反应物</th><th>产物</th><th>收率</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="r in reactions" :key="r.id">
-              <td>{{ r.id || r.reaction_id || '-' }}</td>
-              <td class="rxn-cas">{{ r.cas_registry_id || '-' }}</td>
-              <td class="rxn-text">{{ r.reactants_text || (r.reactants||[]).join(', ') || '-' }}</td>
-              <td class="rxn-text">{{ r.products_text || (r.products||[]).join(', ') || '-' }}</td>
-              <td>{{ r.yield_ != null ? r.yield_ + '%' : (r.yield_text || '-') }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+      <details class="reaction-list" v-if="reactions.length">
+        <summary>反应记录 <span>{{ reactions.length }} 条（按需展开）</span></summary>
+        <div class="reaction-table-wrap">
+          <table class="rxn-table">
+            <thead>
+              <tr><th>ID</th><th>CAS</th><th>反应物</th><th>产物</th><th>收率</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="reaction in reactions" :key="reaction.id">
+                <td>{{ reaction.id || reaction.reaction_id || '-' }}</td>
+                <td class="rxn-cas">{{ reaction.cas_registry_id || '-' }}</td>
+                <td class="rxn-text">{{ reaction.reactants_text || (reaction.reactants || []).join(', ') || '-' }}</td>
+                <td class="rxn-text">{{ reaction.products_text || (reaction.products || []).join(', ') || '-' }}</td>
+                <td>{{ reaction.yield_ != null ? reaction.yield_ + '%' : (reaction.yield_text || '-') }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
     </div>
   </MainLayout>
 </template>
 
 <style scoped>
-.kg-root { }
-.kg-root h2 { font-size: 18px; font-weight: 700; color: var(--primary); margin-bottom: 4px; }
-.subtitle { color: var(--text-light); font-size: 13px; margin-bottom: 12px; }
-
-.kg-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
-.kg-search { flex: 1; max-width: 420px; padding: 9px 14px; border: 1.5px solid var(--border); border-radius: var(--radius); font-size: 13px; outline: none; }
-.kg-search:focus { border-color: var(--primary-light); }
-.kg-clear { padding: 8px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: #fff; color: var(--text-light); cursor: pointer; font-size: 12px; }
-.kg-clear:hover { background: #fef2f2; color: #dc2626; }
-.kg-count { font-size: 12px; color: var(--text-light); margin-left: auto; }
-
-.kg-layout { display: flex; gap: 18px; }
-.kg-canvas { flex: 1; height: 540px; background: #fff; border: 1px solid var(--border); border-radius: var(--radius); }
-.kg-detail { width: 220px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; flex-shrink: 0; }
-.kg-detail h3 { font-size: 14px; margin-bottom: 10px; color: var(--primary); }
-.kg-detail table { width: 100%; font-size: 12px; }
-.kg-detail td { padding: 4px 0; border-bottom: 1px solid var(--border); }
-.kg-detail td:first-child { color: var(--text-light); width: 50px; }
-.kg-focus-btn { margin-top: 10px; width: 100%; padding: 7px; border: 1px solid var(--primary-light); border-radius: var(--radius); background: var(--primary-pale); color: var(--primary); font-size: 12px; cursor: pointer; }
-
+.kg-root { max-width: 1440px; }
+.kg-toolbar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 7px; }
+.kg-search { flex: 1 1 300px; min-width: 180px; max-width: 480px; padding: 10px 13px; border: 1px solid var(--border); border-radius: 9px; font-size: 13px; outline: none; }
+.kg-search:focus { border-color: var(--primary-light); box-shadow: 0 0 0 3px rgba(74,144,164,.12); }
+.kg-clear, .kg-mode { border: 1px solid var(--border); border-radius: 8px; background: #fff; color: var(--primary); padding: 9px 12px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.kg-clear:hover, .kg-mode:hover { background: var(--primary-pale); }
+.kg-toggle { display: inline-flex; align-items: center; gap: 7px; color: #526273; font-size: 12px; white-space: nowrap; cursor: pointer; }
+.kg-toggle input { accent-color: var(--primary); }
+.kg-count { margin-left: auto; color: var(--text-light); font-size: 12px; }
+.kg-hint { color: var(--text-light); font-size: 12px; margin: 0 0 12px; }
+.kg-layout { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 14px; align-items: start; }
+.kg-canvas-wrap:only-child { grid-column:1 / -1 }
+.kg-canvas-wrap { position: relative; min-width: 0; }
+.kg-canvas { width: 100%; height: min(70vh, 720px); min-height: 500px; background: #fff; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.kg-overlay { position: absolute; inset: 0; display: grid; place-items: center; padding: 20px; border: 1px solid var(--border); border-radius: 12px; background: rgba(255,255,255,.92); color: var(--text-light); text-align: center; font-size: 13px; pointer-events: none; }
+.kg-detail { position: relative; background: #fff; border: 1px solid var(--border); border-radius: 12px; padding: 18px 16px; box-shadow: 0 5px 20px rgba(24,45,62,.06); }
+.kg-detail-close { position: absolute; top: 8px; right: 10px; border: 0; background: transparent; color: #98A2B3; font-size: 22px; cursor: pointer; }
+.kg-detail-kicker { color: var(--text-light); text-transform: uppercase; letter-spacing: .06em; font-size: 10px; }
+.kg-detail h3 { margin: 8px 22px 16px 0; color: var(--primary); font-size: 16px; line-height: 1.45; overflow-wrap: anywhere; }
+.kg-detail-row { display: flex; justify-content: space-between; gap: 10px; padding: 9px 0; border-top: 1px solid #EEF1F4; font-size: 12px; }
+.kg-detail-row span { color: var(--text-light); }
+.kg-detail-row strong { color: #344054; text-align: right; }
+.kg-focus-btn { margin-top: 14px; width: 100%; padding: 9px; border: 1px solid var(--primary-light); border-radius: 8px; background: var(--primary-pale); color: var(--primary); font-size: 12px; font-weight: 600; cursor: pointer; }
 .empty-state { text-align: center; padding: 80px 24px; color: var(--text-light); }
 .empty-state .hint { font-size: 13px; margin-top: 8px; }
-
-.reaction-list { margin-top: 24px; background: #fff; border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
-.reaction-list h3 { font-size: 15px; color: var(--primary); margin-bottom: 12px; }
+.reaction-list { margin-top: 16px; background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 0 16px; }
+.reaction-list summary { padding: 14px 0; color: var(--primary); font-size: 14px; font-weight: 650; cursor: pointer; }
+.reaction-list summary span { margin-left: 6px; color: var(--text-light); font-size: 12px; font-weight: 400; }
+.reaction-table-wrap { overflow: auto; max-height: 420px; padding-bottom: 14px; }
 .rxn-table { width: 100%; font-size: 12px; border-collapse: collapse; }
-.rxn-table th { text-align: left; padding: 8px 6px; border-bottom: 2px solid var(--border); color: var(--text-light); font-weight: 600; }
+.rxn-table th { position: sticky; top: 0; text-align: left; padding: 8px 6px; border-bottom: 2px solid var(--border); background: #fff; color: var(--text-light); font-weight: 600; }
 .rxn-table td { padding: 7px 6px; border-bottom: 1px solid var(--border); color: #333; }
 .rxn-table .rxn-cas { font-family: var(--mono); font-size: 11px; color: var(--text-light); max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rxn-table .rxn-text { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rxn-table .rxn-text { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rxn-table tbody tr:hover { background: #f8fafc; }
-@media (max-width: 768px) { .kg-layout { flex-direction: column; } .kg-detail { width: 100%; } }
+@media (max-width: 960px) {
+  .kg-layout { grid-template-columns: minmax(0, 1fr); }
+  .kg-detail { display: grid; grid-template-columns: 1fr 1fr; column-gap: 16px; }
+  .kg-detail h3 { grid-column: 1 / -1; margin-bottom: 8px; }
+  .kg-detail-close { top: 12px; }
+  .kg-focus-btn { grid-column: 1 / -1; }
+  .kg-canvas { height: 62vh; min-height: 420px; }
+}
+@media (max-width: 600px) {
+  .kg-toolbar { align-items: stretch; }
+  .kg-search { flex-basis: 100%; max-width: none; }
+  .kg-count { flex-basis: 100%; margin-left: 0; }
+  .kg-canvas { height: 58vh; min-height: 360px; }
+}
 </style>

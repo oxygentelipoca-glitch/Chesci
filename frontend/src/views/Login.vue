@@ -1,6 +1,7 @@
 <script setup>
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
+import ReactionScheme from '../components/ReactionScheme.vue'
 import { login, register } from '../api/auth.js'
 
 const router = useRouter()
@@ -38,96 +39,45 @@ async function submit() {
 </script>
 
 <template>
-  <div class="login-root">
-    <div class="login-card">
-      <div class="lc-brand">
-        <span class="lc-logo">⬡</span>
-        <h1>ChemGraph AI</h1>
-        <p>智能化学研发平台</p>
-      </div>
-
-      <div class="lc-tabs">
-        <button :class="{ active: mode === 'login' }" @click="switchMode('login')">登录</button>
-        <button :class="{ active: mode === 'register' }" @click="switchMode('register')">注册</button>
-      </div>
-
+  <main class="login-root">
+    <section class="folio">
+      <div class="brand"><img src="/favicon.svg" alt="" />ChemFinder</div>
+      <div class="folio-body"><h1>化学合成路线<br />分析工作台</h1><ReactionScheme /></div>
+      <span class="school">兰州交通大学</span>
+    </section>
+    <section class="login-form">
+      <h2>{{ mode === 'login' ? '登录工作台' : '创建账号' }}</h2>
+      <div class="lc-tabs"><button v-for="[value,label] in [['login','登录'],['register','注册']]" :key="value" :aria-pressed="mode === value" type="button" @click="switchMode(value)">{{ label }}</button></div>
       <form @submit.prevent="submit">
-        <input
-          v-model="username"
-          placeholder="用户名"
-          autocomplete="username"
-        />
-        <input
-          v-model="password"
-          type="password"
-          placeholder="密码（至少 4 位）"
-          autocomplete="current-password"
-        />
-        <p v-if="errorMsg" class="lc-error">{{ errorMsg }}</p>
-        <button type="submit" :disabled="loading">
-          {{ loading ? '请稍候...' : (mode === 'login' ? '登 录' : '注 册') }}
-        </button>
+        <label>用户名<input v-model="username" placeholder="用户名" autocomplete="username" required /></label>
+        <label>密码<input v-model="password" type="password" placeholder="密码（至少 4 位）" :autocomplete="mode === 'login' ? 'current-password' : 'new-password'" required /></label>
+        <p v-if="errorMsg" role="alert" class="lc-error">{{ errorMsg }}</p>
+        <button class="submit" type="submit" :disabled="loading">{{ loading ? '请稍候…' : (mode === 'login' ? '登录' : '注册') }}</button>
       </form>
-
-      <p class="lc-hint">演示账号：demo / demo123</p>
-    </div>
-  </div>
+      <p class="lc-hint">演示账号 <b>demo</b>　密码 <b>demo123</b></p>
+    </section>
+  </main>
 </template>
-
 <style scoped>
-.login-root {
-  height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: linear-gradient(135deg, #0d9488, #0f766e);
-}
-
-.login-card {
-  width: 380px;
-  background: #fff;
-  border-radius: 16px;
-  padding: 36px 32px 28px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
-}
-
-.lc-brand { text-align: center; margin-bottom: 24px; }
-.lc-logo { font-size: 40px; }
-.lc-brand h1 { font-size: 22px; font-weight: 700; color: #0d9488; margin: 6px 0 2px; }
-.lc-brand p { font-size: 12px; color: #9ca3af; }
-
-.lc-tabs { display: flex; background: #f3f4f6; border-radius: 10px; padding: 4px; margin-bottom: 20px; }
-.lc-tabs button {
-  flex: 1; padding: 8px; border: none; background: transparent;
-  border-radius: 8px; font-size: 14px; font-weight: 600; color: #6b7280; cursor: pointer;
-  transition: all 0.15s;
-}
-.lc-tabs button.active { background: #fff; color: #0d9488; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-
-form { display: flex; flex-direction: column; gap: 12px; }
-form input {
-  padding: 12px 16px;
-  border: 1.5px solid #e5e7eb;
-  border-radius: 10px;
-  font-size: 14px;
-  outline: none;
-  transition: border 0.15s;
-}
-form input:focus { border-color: #0d9488; }
-.lc-error { font-size: 12px; color: #991b1b; margin: 0; }
-form button {
-  padding: 12px;
-  background: #0d9488;
-  color: #fff;
-  border: none;
-  border-radius: 10px;
-  font-size: 15px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.15s;
-}
-form button:hover { background: #0f766e; }
-form button:disabled { opacity: 0.6; cursor: not-allowed; }
-
-.lc-hint { text-align: center; font-size: 12px; color: #9ca3af; margin-top: 16px; }
+.login-root { min-height:100svh; display:grid; grid-template-columns:minmax(0,1.1fr) minmax(0,1fr); background:#fff }
+.folio { background:#143d43; color:#e6f6ed; display:flex; flex-direction:column; justify-content:space-between; gap:32px; padding:clamp(30px,6vw,100px) }
+.brand { color:white }
+.folio h1 { font-size:clamp(36px,4.4vw,68px); line-height:1.2; letter-spacing:-.05em; margin-bottom:4vw }
+.folio .scheme { max-width:550px }
+.school,.lc-hint { font-size:13px }
+.school { color:#b5d6cd }
+.login-form { align-self:center; justify-self:center; width:min(74%,360px); padding:40px 0 }
+.login-form h2 { font-size:30px; margin-bottom:20px }
+.lc-tabs { display:flex; border-bottom:1px solid var(--border); margin-bottom:22px }
+button { cursor:pointer }
+.lc-tabs button { font-size:15px; padding:8px 18px; border:0; border-bottom:3px solid transparent; background:none; color:var(--text-light) }
+.lc-tabs button[aria-pressed=true] { border-bottom-color:var(--primary); color:var(--primary); font-weight:700 }
+form,label { display:grid; gap:7px }
+form { gap:16px }
+input { border:1px solid var(--border); border-radius:6px; padding:12px; font-size:15px }
+.submit { color:white; background:var(--primary); border:0; border-radius:6px; min-height:44px; font-weight:650; font-size:15px }
+.submit:disabled { opacity:.65 }
+.lc-hint { color:var(--text-light); margin-top:18px }
+.lc-error { color:var(--danger) }
+@media(max-width:700px){.login-root { grid-template-columns:1fr; align-content:start }.folio { padding:20px 6vw; gap:14px }.folio-body { display:flex; align-items:center; gap:12px }.folio h1 { font-size:23px; flex-shrink:0; margin:0 }.folio .scheme { width:58%; max-width:240px }.school { display:none }.login-form { width:min(88%,380px) }}
 </style>

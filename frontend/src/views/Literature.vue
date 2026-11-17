@@ -54,13 +54,12 @@ async function doSearch() {
 <template>
   <MainLayout>
     <div class="lit-root">
-      <h2>文献检索</h2>
-      <p class="sub">{{ mode === 'local' ? '基于 reactions.db · CAS / 文献标题 / 反应物产物全文搜索' : '在线学术文献检索 · OpenAlex / Crossref 开放 API' }}</p>
+      <header class="page-intro"><h1>文献检索</h1><p>{{ mode === 'local' ? '按 CAS 号、文献标题或反应物与产物检索已收录的记录。' : '通过 OpenAlex 或 Crossref 查找学术论文与 DOI。' }}</p></header>
 
       <!-- 检索源切换 -->
       <div class="lit-tabs">
-        <button :class="{ active: mode === 'local' }" @click="switchMode('local')">📂 本地库（reactions.db）</button>
-        <button :class="{ active: mode === 'online' }" @click="switchMode('online')">🌐 在线文献</button>
+        <button :class="{ active: mode === 'local' }" @click="switchMode('local')">本地反应库</button>
+        <button :class="{ active: mode === 'online' }" @click="switchMode('online')">在线文献</button>
         <span v-if="mode === 'online'" class="lit-source">
           <label><input type="radio" v-model="onlineSource" value="openalex" /> OpenAlex</label>
           <label><input type="radio" v-model="onlineSource" value="crossref" /> Crossref</label>
@@ -69,6 +68,7 @@ async function doSearch() {
 
       <div class="lit-search">
         <input
+          aria-label="文献检索关键词"
           v-model="query"
           @keyup.enter="doSearch"
           :placeholder="mode === 'local' ? '搜索 CAS 号、反应物/产物或文献关键词...' : '输入文献关键词，如 cinnamic acid synthesis'"
@@ -93,7 +93,7 @@ async function doSearch() {
               <span v-if="r.scheme_number">Scheme #{{ r.scheme_number }}</span>
             </div>
             <div class="lc-footer" v-if="r.literature_title">
-              <span>📄 {{ r.literature_title }}</span>
+              <span>{{ r.literature_title }}</span>
             </div>
           </div>
         </template>
@@ -117,7 +117,7 @@ async function doSearch() {
                 target="_blank"
                 rel="noopener"
                 class="lc-doi"
-              >🔗 DOI: {{ r.doi }}</a>
+              >DOI: {{ r.doi }}</a>
               <span class="lc-src">{{ r.source === 'crossref' ? 'Crossref' : 'OpenAlex' }}</span>
             </div>
           </div>
@@ -131,10 +131,8 @@ async function doSearch() {
 
 <style scoped>
 .lit-root { max-width: 900px; }
-.lit-root h2 { font-size: 18px; font-weight: 700; color: var(--primary); margin-bottom: 4px; }
-.sub { color: var(--text-light); font-size: 13px; margin-bottom: 16px; }
 
-.lit-tabs { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.lit-tabs { display: flex; flex-wrap:wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
 .lit-tabs button {
   padding: 6px 14px; border: 1.5px solid var(--border); background: #fff;
   border-radius: var(--radius); font-size: 13px; font-weight: 600; cursor: pointer;
@@ -145,7 +143,7 @@ async function doSearch() {
 .lit-source label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
 
 .lit-search { display: flex; gap: 8px; margin-bottom: 12px; }
-.lit-search input { flex: 1; padding: 10px 16px; border: 1.5px solid var(--border); border-radius: var(--radius); font-size: 14px; outline: none; }
+.lit-search input { min-width:0; flex: 1; padding: 10px 16px; border: 1.5px solid var(--border); border-radius: var(--radius); font-size: 14px; outline: none; }
 .lit-search input:focus { border-color: var(--primary-light); }
 .lit-search button { padding: 10px 28px; background: var(--primary); color: #fff; border: none; border-radius: var(--radius); font-weight: 600; cursor: pointer; }
 .lit-search button:disabled { opacity: 0.6; }

@@ -5,6 +5,9 @@
  * 统一 RoutePlanning / ChemistryPanel 两处的反应卡片渲染：
  * 反应式、条件/文献/收率标签、四维评分条，可选"生成实验方案"按钮。
  */
+import ConstraintEvidence from './ConstraintEvidence.vue'
+import PaperLinks from './PaperLinks.vue'
+import { sourceLocation, paperLinks, pdfEvidenceLines } from '../utils/routeEvidence.js'
 import { computed } from 'vue'
 import { fmtScore } from '../composables/useReactionSearch.js'
 
@@ -20,7 +23,7 @@ const props = defineProps({
 const emit = defineEmits(['select', 'generate'])
 
 const title = computed(() =>
-  props.reaction.cas_registry_id || props.reaction.name || (props.rank ? `反应 ${props.rank}` : '反应')
+  props.reaction.cas_registry_id || props.reaction.name || (props.reaction.id != null ? `反应 #${props.reaction.id}` : '反应')
 )
 
 // 方程式显示优先级：中文方程式 → SMILES 方程式 → 反应物/产物文本
@@ -69,12 +72,28 @@ const scoreBars = computed(() => {
 
       <div class="rc-conds">
         <span v-if="reaction.conditions_summary?.length" class="cond">🔬 {{ reaction.conditions_summary.length }} 组条件</span>
+        <span v-if="reaction.matched_conditions != null" class="cond match" :class="{ exact: reaction.exact }">
+          {{ reaction.exact ? '全部筛选满足' : `匹配 ${reaction.matched_conditions} 项` }}
+        </span>
         <span v-if="reaction.literature_title" class="cond">📄 {{ reaction.literature_title.slice(0, 40) }}</span>
-        <span v-if="reaction.yield_ != null" class="cond yield">收率 {{ reaction.yield_ }}%</span>
+        <span v-if="reaction.yield_ != null" class="cond yield">收率 {{ String(reaction.yield_).replace(/[%％]$/, '') }}%</span>
         <span v-else-if="reaction.yield" class="cond yield">收率 {{ reaction.yield }}%</span>
       </div>
 
-      <div v-if="score" class="rc-bars">
+      <ConstraintEvidence v-if="reaction.checks?.length" :checks="reaction.checks" />
+      <p v-if="reaction.id != null" class="basis">依据：{{ sourceLocation(reaction) }}</p>
+      <details v-if="reaction.paper_evidence?.length">
+        <summary>核对 PDF 原文</summary>
+        <p v-for="(line, i) in pdfEvidenceLines(reaction)" :key="i" class="basis">{{ line }}</p>
+      </details>
+      <PaperLinks :links="paperLinks(reaction)" />
+      <details v-if="score?.dimensions?.length">
+        <summary>综合评分怎么算 · {{ fmtScore(score.total) }} 分</summary>
+        <p v-for="part in score.dimensions" :key="part.label" class="basis">
+          {{ part.label }} {{ part.score }} 分 × {{ part.weight }}%：{{ part.basis }}
+        </p>
+      </details>
+      <div v-else-if="score" class="rc-bars">
         <div v-for="b in scoreBars" :key="b.label" class="bar-row">
           <span class="bar-lbl">{{ b.label }}</span>
           <div class="bar-trk"><div class="bar-fil" :style="{ width: (b.value || 0) + '%' }"></div></div>
@@ -120,8 +139,13 @@ const scoreBars = computed(() => {
 }
 .rc-conds { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 .cond { font-size: 11px; padding: 3px 8px; background: #F3F4F6; border-radius: 4px; }
+.cond.match { background: #EEF2F6; color: #586779; }
+.cond.match.exact { background: #D1FAE5; color: #065F46; font-weight: 600; }
 .cond.yield { background: #D1FAE5; color: #065F46; font-weight: 600; }
 
+.basis { margin: 5px 0; font-size: 12px; overflow-wrap: anywhere; }
+details { margin: 8px 0; }
+summary { cursor: pointer; font-size: 13px; }
 .rc-bars { display: flex; flex-direction: column; gap: 3px; }
 .bar-row { display: flex; align-items: center; gap: 6px; }
 .bar-lbl { width: 30px; font-size: 10px; color: var(--text-light); }

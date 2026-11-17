@@ -7,3 +7,10 @@ vector_db
 documents
 frontend/node_modules
 frontend/dist
+
+*.db*
+.chemroute-demo
+models
+.agents
+.codewhale
+scifinder_extracted.json

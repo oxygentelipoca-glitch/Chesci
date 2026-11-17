@@ -4,7 +4,7 @@
 ----
 * **主数据库 (database.db)**：SQLite，存储通用业务数据（User、Conversation、Message、File）。
 * **化学数据库 (reactions.db)**：SQLite，存储 SciFinder 提取的反应数据（schemes、reactions、reaction_conditions、literature、extraction_log）。
-  reactions.db 由外部 SciFinder PDF 提取程序生成和维护，本模块仅进行只读映射。
+  支持在网页中预览、校对并导入 SciFinder PDF 提取结果。
 
 环境变量
 --------
@@ -121,7 +121,7 @@ def get_session():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 化学数据库（reactions.db — 外部维护，只读映射）
+# 化学数据库（reactions.db）
 # ═══════════════════════════════════════════════════════════════════════════
 
 CHEMISTRY_DB_URL = os.getenv("CHEMISTRY_DB_URL", "sqlite:///reactions.db")

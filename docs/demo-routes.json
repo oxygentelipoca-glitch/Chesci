@@ -1,0 +1,45 @@
+{
+  "说明": "人工编写的界面测试数据。温度、时间和收率均为模拟值；来源卡不是论文，也不是实验依据。",
+  "schemes": [
+    {
+      "scheme_number": 1,
+      "page_start": 1,
+      "steps": 1,
+      "description": "模拟路线 A"
+    },
+    {
+      "scheme_number": 2,
+      "page_start": 2,
+      "steps": 1,
+      "description": "模拟路线 B"
+    }
+  ],
+  "reactions": [
+    {
+      "scheme_number": 1,
+      "page": 1,
+      "reactants": "苯甲醛",
+      "products": "肉桂酸",
+      "yield": "72%",
+      "conditions": {
+        "temperature": "65 °C",
+        "time": "4 h"
+      },
+      "title": "模拟来源卡 A（非论文）",
+      "source": "ChemRoute 内置教学样例"
+    },
+    {
+      "scheme_number": 2,
+      "page": 2,
+      "reactants": "苯甲醛",
+      "products": "肉桂酸",
+      "yield": "90%",
+      "conditions": {
+        "temperature": "110 °C",
+        "time": "2 h"
+      },
+      "title": "模拟来源卡 B（非论文）",
+      "source": "ChemRoute 内置教学样例"
+    }
+  ]
+}

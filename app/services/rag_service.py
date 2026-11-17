@@ -17,8 +17,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from sentence_transformers import CrossEncoder, SentenceTransformer
-import chromadb
+from sentence_transformers import CrossEncoder
+from utils.rag_resources import get_collection, get_embedding_model
 
 from utils.bm25_index import get_bm25_index, refresh_bm25_index
 
@@ -27,19 +27,6 @@ from utils.bm25_index import get_bm25_index, refresh_bm25_index
 # ---------------------------------------------------------------------------
 
 load_dotenv()
-
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com",
-)
-
-embedding_model = SentenceTransformer(
-    "BAAI/bge-base-zh-v1.5",
-    local_files_only=True,
-)
-
-chroma_client = chromadb.PersistentClient(path="vector_db")
-collection = chroma_client.get_collection("knowledge")
 
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
 MAX_DENSE_DISTANCE = float(os.getenv("RAG_MAX_DENSE_DISTANCE", "1.05"))
@@ -61,14 +48,14 @@ def _ensure_bm25() -> None:
     """Build the global BM25 index from Chroma on first use."""
     global _bm25_ready
     if not _bm25_ready:
-        refresh_bm25_index(collection)
+        refresh_bm25_index(get_collection())
         _bm25_ready = True
 
 
 def rebuild_bm25() -> None:
     """Force-rebuild the BM25 index (call after document changes)."""
     global _bm25_ready
-    refresh_bm25_index(collection)
+    refresh_bm25_index(get_collection())
     _bm25_ready = True
 
 
@@ -280,11 +267,11 @@ def search_knowledge(
     )
 
     # ---- 1. Dense (vector) retrieval ------------------------------------
-    vector = embedding_model.encode(question, normalize_embeddings=True).tolist()
+    vector = get_embedding_model().encode(question, normalize_embeddings=True).tolist()
     dense_candidates: list[tuple[str, dict[str, Any], float]] = []
 
     if user_id is not None:
-        r = collection.query(
+        r = get_collection().query(
             query_embeddings=[vector],
             n_results=top_k,
             where=_make_where(str(user_id), stored_filenames),
@@ -292,7 +279,7 @@ def search_knowledge(
         )
         _collect_dense(r, dense_candidates)
 
-    r = collection.query(
+    r = get_collection().query(
         query_embeddings=[vector],
         n_results=top_k,
         where=_make_where("system", stored_filenames),
@@ -490,6 +477,7 @@ def ask_question(
         }
     )
 
+    client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
     response = client.chat.completions.create(
         model="deepseek-chat",
         temperature=0.1,

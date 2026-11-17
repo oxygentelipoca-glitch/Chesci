@@ -13,7 +13,6 @@ from app.core.auth import get_current_user, resolve_current_user_id
 from app.core.response import api_success
 from app.database import engine
 from app.models import Conversation, Message
-from app.services.rag_service import ask_question
 
 router = APIRouter(tags=["Chat"])
 
@@ -134,6 +133,7 @@ def chat(
     # Resolve file_ids → stored_filenames for file-scoped search
     stored_filenames = _resolve_stored_filenames(request.file_ids, user_id)
 
+    from app.services.rag_service import ask_question
     result = ask_question(
         request.question,
         user_id=user_id,

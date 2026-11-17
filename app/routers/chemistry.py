@@ -14,15 +14,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
+import re
 import urllib.parse
 import urllib.request
-from typing import Optional
+from io import BytesIO
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func
 from sqlmodel import Session, select
+from starlette.concurrency import run_in_threadpool
 
 from app.core.auth import get_current_user, get_optional_current_user
 from app.core.response import api_error, api_success
@@ -47,8 +53,217 @@ from app.chemistry.reaction_parser import (
 )
 from app.services.chemistry_service import analyze_target
 from app.chemistry.agent import generate_experiment_plan
+from app.chemistry.paper_import import Citation, extract_paper_preview
+from app.chemistry.scifinder_import import import_reviewed_reactions
 
 router = APIRouter(prefix="/api/chemistry", tags=["Chemistry"])
+logger = logging.getLogger(__name__)
+
+SCIFINDER_MAX_PDF_BYTES = 20 * 1024 * 1024
+SCIFINDER_MAX_PAGES = 500
+SCIFINDER_MAX_REACTIONS = 500
+
+
+class SciFinderSchemePreview(BaseModel):
+    scheme_number: int = Field(ge=1)
+    reaction_count: int = Field(default=1, ge=1)
+    overall_yield: Optional[str] = None
+    overall_steps: Optional[int] = Field(default=None, ge=1)
+    page_start: int = Field(default=1, ge=1)
+    page_end: int = Field(default=1, ge=1)
+    description: Optional[str] = None
+
+
+class SciFinderReactionPreview(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    scheme_number: int = Field(default=1, ge=1)
+    page: int = Field(default=1, ge=1)
+    reaction_id: Optional[str] = None
+    title: Optional[str] = None
+    authors: Optional[str] = None
+    source: Optional[str] = None
+    reactants: list[str] = Field(default_factory=list, max_length=100)
+    products: list[str] = Field(default_factory=list, max_length=100)
+    yield_: Optional[str] = Field(default=None, alias="yield")
+    conditions: dict = Field(default_factory=dict)
+    paper_evidence: list[Citation] = Field(default_factory=list, max_length=8)
+    procedure: Optional[str] = None
+    workup: Optional[str] = None
+    purification: Optional[str] = None
+
+
+class SciFinderImportConfirmation(BaseModel):
+    source_sha256: str = Field(min_length=64, max_length=64, pattern="^[0-9a-f]{64}$")
+    file_name: str = Field(min_length=1, max_length=255)
+    page_count: int = Field(ge=1, le=SCIFINDER_MAX_PAGES)
+    model: Optional[str] = Field(default=None, max_length=100)
+    schemes: list[SciFinderSchemePreview] = Field(default_factory=list, max_length=100)
+    reactions: list[SciFinderReactionPreview] = Field(min_length=1, max_length=500)
+
+
+def _extract_scifinder_preview(pdf_bytes: bytes, max_schemes: int, model: str, document_type: str = "scifinder") -> dict:
+    """Extract a bounded number of schemes and retain page references."""
+    import pdfplumber
+
+    from scripts.extract_scifinder_llm import (
+        _get_client,
+        extract_page_text,
+        extract_scheme_with_llm,
+        quick_extract_overview,
+        split_into_schemes,
+    )
+
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        if len(pdf.pages) > SCIFINDER_MAX_PAGES:
+            raise ValueError(f"PDF 最多支持 {SCIFINDER_MAX_PAGES} 页")
+        page_texts = [extract_page_text(page, deduplicate=document_type == "scifinder") for page in pdf.pages]
+
+    if document_type == "paper":
+        return extract_paper_preview(page_texts, _get_client(), model)
+
+    page_for_scheme: dict[int, int] = {}
+    for page_number, page_text in enumerate(page_texts, 1):
+        for match in re.finditer(r"Scheme\s+(\d+)", page_text, re.I):
+            page_for_scheme.setdefault(int(match.group(1)), page_number)
+
+    document_text = "\n".join(page_texts)
+    all_schemes = split_into_schemes(document_text)
+    if not all_schemes:
+        raise ValueError("PDF 中没有识别到可提取的 Scheme 文本；扫描件请先进行 OCR。")
+
+    selected_schemes = all_schemes[:max_schemes]
+    client = _get_client()
+    extracted: list[dict] = []
+    scheme_previews: list[dict] = []
+    failed_schemes = 0
+    reactions_truncated = False
+    for scheme_number, scheme_text in selected_schemes:
+        overview = quick_extract_overview(scheme_text)
+        page_number = page_for_scheme.get(scheme_number, 1)
+        scheme_previews.append({
+            "scheme_number": max(1, scheme_number),
+            "reaction_count": max(1, int(overview.get("reaction_count") or 1)),
+            "overall_yield": (
+                f"{overview['yield_min']}%" if overview.get("yield_min") is not None
+                and overview.get("yield_max") in (None, overview.get("yield_min"))
+                else f"{overview['yield_min']}-{overview['yield_max']}%"
+                if overview.get("yield_min") is not None else None
+            ),
+            "overall_steps": overview.get("steps"),
+            "page_start": page_number,
+            "page_end": page_number,
+        })
+        found = extract_scheme_with_llm(client, scheme_number, scheme_text, model, compact=True)
+        if not found:
+            failed_schemes += 1
+            continue
+        for item in found:
+            if len(extracted) >= SCIFINDER_MAX_REACTIONS:
+                reactions_truncated = True
+                break
+            if not isinstance(item, dict):
+                continue
+            normalized = dict(item)
+            normalized.pop("_scheme_num", None)
+            normalized["scheme_number"] = max(1, scheme_number)
+            normalized["page"] = page_number
+            for name in ("reactants", "products"):
+                value = normalized.get(name)
+                if isinstance(value, str):
+                    normalized[name] = [value] if value.strip() else []
+                elif isinstance(value, list):
+                    normalized[name] = [str(part).strip() for part in value if str(part).strip()]
+                else:
+                    normalized[name] = []
+            conditions = normalized.get("conditions")
+            normalized["conditions"] = conditions if isinstance(conditions, dict) else {}
+            for name in ("reaction_id", "title", "authors", "source", "yield", "procedure", "workup", "purification"):
+                value = normalized.get(name)
+                if value is not None and not isinstance(value, str):
+                    normalized[name] = str(value)
+            extracted.append(normalized)
+        if reactions_truncated:
+            break
+
+    return {
+        "page_count": len(page_texts),
+        "schemes": scheme_previews,
+        "reactions": extracted,
+        "failed_schemes": failed_schemes,
+        "total_scheme_count": len(all_schemes),
+        "selected_scheme_count": len(selected_schemes),
+        "reactions_truncated": reactions_truncated,
+    }
+
+
+@router.post("/import/scifinder/preview")
+async def preview_scifinder_import(
+    file: UploadFile = File(...),
+    max_schemes: int = Form(default=5, ge=1, le=20),
+    document_type: Literal["scifinder", "paper"] = Form(default="scifinder"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Extract a SciFinder PDF for user review; the uploaded file is not retained."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        return api_error("请上传 PDF 文件", status_code=415)
+    if file.size is not None and file.size > SCIFINDER_MAX_PDF_BYTES:
+        await file.close()
+        return api_error("PDF 文件不能超过 20 MB", status_code=413)
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        await file.close()
+        return api_error("服务器尚未配置 DEEPSEEK_API_KEY，无法提取 PDF", status_code=503)
+
+    pdf_bytes = await file.read(SCIFINDER_MAX_PDF_BYTES + 1)
+    await file.close()
+    if len(pdf_bytes) > SCIFINDER_MAX_PDF_BYTES:
+        return api_error("PDF 文件不能超过 20 MB", status_code=413)
+    if not pdf_bytes.startswith(b"%PDF-"):
+        return api_error("文件内容不是有效的 PDF", status_code=415)
+
+    model = os.getenv("LLM_MODEL", "deepseek-chat")
+    try:
+        result = await run_in_threadpool(_extract_scifinder_preview, pdf_bytes, max_schemes, model, document_type)
+    except ImportError:
+        return api_error("PDF 提取依赖未安装，请安装项目依赖后重试", status_code=503)
+    except ValueError as exc:
+        return api_error(str(exc), status_code=422)
+    except Exception:
+        logger.exception("SciFinder PDF extraction failed")
+        return api_error("PDF 提取失败，请检查 PDF 格式和服务器 LLM 服务配置", status_code=502)
+
+    if not result["reactions"]:
+        return api_error("没有提取到反应记录；请检查 PDF 文本和模型配置", status_code=422)
+    result.update({
+        "file_name": os.path.basename(file.filename),
+        "source_sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+        "model": model,
+        "review_notice": "提取结果需要人工核对。PDF 仅在本次请求中处理，不会保存在服务器上。",
+    })
+    return api_success("PDF 预览提取完成", result)
+
+
+@router.post("/import/scifinder/confirm")
+def confirm_scifinder_import(
+    request: SciFinderImportConfirmation,
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist the user's reviewed and corrected SciFinder extraction."""
+    if any(c.page > request.page_count for item in request.reactions for c in item.paper_evidence):
+        return api_error("引文页码超出 PDF 页数", status_code=422)
+    reactions = [item.model_dump(by_alias=True, exclude_none=True) for item in request.reactions]
+    schemes = [item.model_dump(exclude_none=True) for item in request.schemes]
+    result = import_reviewed_reactions(
+        reactions=reactions,
+        schemes=schemes,
+        file_name=os.path.basename(request.file_name),
+        source_sha256=request.source_sha256,
+        page_count=request.page_count,
+        model_used=request.model,
+    )
+    if result["duplicate"]:
+        return api_success("这个 PDF 已经导入过", result)
+    return api_success("已导入校对后的反应记录", result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -410,6 +625,9 @@ def create_experiment_plan(
         literature_context=request.literature_context,
         extra_instructions=request.extra_instructions,
     )
+    if result.get("mode") == "offline_record":
+        result["review_notice"] = "离线草案仅整理所选记录，未经模型分析或实验验证。"
+        return api_success("已整理路线记录草案", result)
     result["review_notice"] = "AI 生成内容仅为研究草案；请核对原始文献、实验室规范和安全要求后再决定是否采用。"
     return api_success("实验方案草案已生成", result)
 

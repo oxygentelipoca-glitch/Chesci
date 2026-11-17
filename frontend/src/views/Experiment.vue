@@ -1,5 +1,6 @@
 <script setup>
 import { reactive, ref, computed, onBeforeUnmount, onMounted } from 'vue'
+import ConstraintEvidence from '../components/ConstraintEvidence.vue'
 import MarkdownIt from 'markdown-it'
 import { getReaction, getSearchHistory, deleteSearchHistory, clearSearchHistory } from '../api/chemistry.js'
 import { useReactionSearch } from '../composables/useReactionSearch.js'
@@ -89,46 +90,6 @@ function resetFilters() {
   filters.solvent = 'any'
   filters.solventName = ''
   filters.topN = 5
-}
-
-// 单项条件是否满足（用于结果高亮）
-function condYield(item) {
-  const m = filterMatches.value?.filters?.min_yield
-  return m == null || item.yield_val >= m
-}
-function condSteps(item) {
-  const m = filterMatches.value?.filters?.max_steps
-  return m == null || item.steps_val <= m
-}
-function condTemp(item) {
-  const m = filterMatches.value?.filters?.max_temperature
-  return m == null || (item.temp_val != null && item.temp_val <= m)
-}
-function condTime(item) {
-  const m = filterMatches.value?.filters?.max_time_hours
-  return m == null || (item.time_val != null && item.time_val <= m)
-}
-function condCatalyst(item) {
-  const p = filterMatches.value?.filters?.catalyst
-  return p == null || p === 'any' || (p === 'with') === !!item.catalyst_val
-}
-function condWorkup(item) {
-  const p = filterMatches.value?.filters?.workup
-  return p == null || p === 'any' || (p === 'with') === !!item.workup_val
-}
-function condSolvent(item) {
-  const p = filterMatches.value?.filters?.solvent
-  return p == null || p === 'any' || (p === 'with') === !!item.solvent_val
-}
-function condCatalystName(item) {
-  const k = filterMatches.value?.filters?.catalyst_name
-  if (!k || !String(k).trim()) return true
-  return ((item.catalyst_names || '').toLowerCase()).includes(String(k).trim().toLowerCase())
-}
-function condSolventName(item) {
-  const k = filterMatches.value?.filters?.solvent_name
-  if (!k || !String(k).trim()) return true
-  return ((item.solvent_names || '').toLowerCase()).includes(String(k).trim().toLowerCase())
 }
 
 // ---- 分析进度条（分阶段模拟推进，响应返回后跳到 100%）----
@@ -231,14 +192,12 @@ async function viewReaction(id) {
 <template>
   <MainLayout>
     <div class="exp-root">
-      <div class="exp-header">
-        <h2>实验方案生成</h2>
-        <p>输入化合物名称或 CAS Registry ID，AI 分析合成路线并生成实验建议</p>
-      </div>
+      <header class="page-intro"><h1>实验助手</h1><p>按化合物名称或 CAS 号检索反应，依据选定路线生成实验方案草案。</p></header>
 
       <div class="exp-search">
         <div class="es-row">
           <input
+            aria-label="目标化合物"
             v-model="query"
             @keyup.enter="startAnalysis()"
             @input="handleSearch"
@@ -260,7 +219,7 @@ async function viewReaction(id) {
 
       <!-- Filter conditions -->
       <details class="es-filters" open>
-        <summary>🎛️ 筛选条件（可选，留空则忽略）</summary>
+        <summary>筛选条件（可选，留空则忽略）</summary>
         <div class="esf-grid">
           <label class="esf-item">
             <span>最低收率</span>
@@ -277,7 +236,7 @@ async function viewReaction(id) {
             <input v-model="filters.maxSteps" type="number" min="1" max="20" placeholder="如 3" />
           </label>
           <label class="esf-item">
-            <span>最长时间</span>
+            <span>最长单段时间</span>
             <input v-model="filters.maxTime" type="number" min="0" placeholder="如 6" />
             <em>h</em>
           </label>
@@ -465,15 +424,7 @@ async function viewReaction(id) {
                 {{ item.equation_zh || item.equation || item.cas_registry_id || ('反应 #' + item.id) }}
               </div>
               <div class="erf-tags">
-                <span class="erf-tag" :class="condYield(item) ? 'ok' : 'miss'">收率 {{ item.yield_val }}%</span>
-                <span class="erf-tag" :class="condSteps(item) ? 'ok' : 'miss'">步骤 {{ item.steps_val }}</span>
-                <span class="erf-tag" :class="condTemp(item) ? 'ok' : 'miss'">温度 {{ item.temp_val != null ? item.temp_val + ' °C' : '未知' }}</span>
-                <span class="erf-tag" :class="condTime(item) ? 'ok' : 'miss'">时间 {{ item.time_val != null ? item.time_val + ' h' : '未知' }}</span>
-                <span class="erf-tag" :class="condCatalyst(item) ? 'ok' : 'miss'" :title="item.catalyst_names || undefined">催化剂 {{ item.catalyst_val ? '有' : '无' }}</span>
-                <span v-if="filterMatches?.filters?.catalyst_name" class="erf-tag" :class="condCatalystName(item) ? 'ok' : 'miss'">催化剂含 {{ filterMatches.filters.catalyst_name }}</span>
-                <span class="erf-tag" :class="condWorkup(item) ? 'ok' : 'miss'">后处理 {{ item.workup_val ? '有' : '无' }}</span>
-                <span class="erf-tag" :class="condSolvent(item) ? 'ok' : 'miss'" :title="item.solvent_names || undefined">溶剂 {{ item.solvent_val ? '有' : '无' }}</span>
-                <span v-if="filterMatches?.filters?.solvent_name" class="erf-tag" :class="condSolventName(item) ? 'ok' : 'miss'">溶剂含 {{ filterMatches.filters.solvent_name }}</span>
+                <ConstraintEvidence :checks="item.checks || []" />
                 <span v-if="item.exact" class="erf-tag exact">✓ 完全匹配</span>
                 <span v-else class="erf-tag partial">{{ item.matched_conditions }}/{{ activeConditionCount }} 项满足</span>
               </div>
@@ -532,9 +483,6 @@ async function viewReaction(id) {
 
 <style scoped>
 .exp-root { max-width: 960px; }
-.exp-header { margin-bottom: 20px; }
-.exp-header h2 { font-size: 20px; font-weight: 700; color: var(--primary); margin-bottom: 4px; }
-.exp-header p { color: var(--text-light); font-size: 13px; }
 
 .exp-search { position: relative; margin-bottom: 24px; }
 .es-row { display: flex; gap: 10px; }
@@ -670,4 +618,5 @@ async function viewReaction(id) {
 .erf-score { font-size: 16px; font-weight: 700; color: var(--primary); flex-shrink: 0; }
 
 @media (max-width: 768px) { .er-stats { flex-wrap: wrap; gap: 12px; } .er-tabs { flex-wrap: wrap; } }
+.es-row input { min-width:0 }
 </style>
